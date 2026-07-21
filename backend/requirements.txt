@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+kiteconnect
+python-dotenv
+supabase
+httpx
+pandas
+numpy
+ta
