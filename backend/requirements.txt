@@ -1,2 +1,6 @@
 fastapi
 uvicorn[standard]
+fastapi
+uvicorn[standard]
+kiteconnect
+python-dotenv
