@@ -6,6 +6,7 @@ from zoneinfo import ZoneInfo
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse
+from pydantic import BaseModel, Field
 from kiteconnect import KiteConnect
 from supabase import Client, create_client
 
@@ -13,7 +14,7 @@ IST = ZoneInfo("Asia/Kolkata")
 
 app = FastAPI(
     title="VOTE Data Engine",
-    version="0.4.0",
+    version="0.4.1",
     description="Backend service for the Vivek Options Trading Engine",
 )
 
@@ -127,6 +128,19 @@ def get_kite_client() -> KiteConnect:
     return kite
 
 
+class ResolveInstrumentRequest(BaseModel):
+    symbol: str = Field(min_length=1, max_length=50)
+    instrument_type: str = Field(
+        description="OPTION or FUTURE"
+    )
+    expiry: date
+    strike: float | None = Field(default=None, ge=0)
+    option_type: str | None = Field(
+        default=None,
+        description="CE or PE for option contracts",
+    )
+
+
 def serialize_instrument(
     instrument: dict[str, Any],
 ) -> dict[str, Any]:
@@ -145,7 +159,7 @@ def serialize_instrument(
 def root() -> dict[str, str]:
     return {
         "application": "VOTE Data Engine",
-        "version": "0.4.0",
+        "version": "0.4.1",
         "status": "running",
     }
 
@@ -352,12 +366,19 @@ def market_instruments(
             item_strike = float(instrument.get("strike") or 0)
 
             if normalized_underlying:
-                matches_underlying = (
-                    name == normalized_underlying
-                    or tradingsymbol.startswith(
-                        normalized_underlying
+                # Kite's derivative instrument rows include the exact
+                # underlying in `name`. Use that first so NIFTY does
+                # not accidentally include NIFTYNXT50.
+                if name:
+                    matches_underlying = (
+                        name == normalized_underlying
                     )
-                )
+                else:
+                    matches_underlying = (
+                        tradingsymbol.startswith(
+                            normalized_underlying
+                        )
+                    )
 
                 if not matches_underlying:
                     continue
@@ -417,3 +438,144 @@ def market_instruments(
                 f"{str(exc)}"
             ),
         ) from exc
+
+@app.post("/market/resolve-instrument")
+def resolve_instrument(
+    request: ResolveInstrumentRequest,
+) -> dict[str, Any]:
+    """Resolve one NFO option or futures contract."""
+    try:
+        kite = get_kite_client()
+        instruments = kite.instruments("NFO")
+
+        symbol = request.symbol.strip().upper()
+        requested_type = request.instrument_type.strip().upper()
+        option_type = (
+            request.option_type.strip().upper()
+            if request.option_type
+            else None
+        )
+
+        if requested_type not in {"OPTION", "FUTURE"}:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "instrument_type must be OPTION or FUTURE"
+                ),
+            )
+
+        if requested_type == "OPTION":
+            if option_type not in {"CE", "PE"}:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "option_type must be CE or PE for options"
+                    ),
+                )
+
+            if request.strike is None or request.strike <= 0:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "strike must be greater than zero for options"
+                    ),
+                )
+
+        matches: list[dict[str, Any]] = []
+
+        for instrument in instruments:
+            name = str(
+                instrument.get("name") or ""
+            ).upper()
+            item_type = str(
+                instrument.get("instrument_type") or ""
+            ).upper()
+            item_expiry = instrument.get("expiry")
+            item_strike = float(
+                instrument.get("strike") or 0
+            )
+
+            if name != symbol:
+                continue
+
+            if isinstance(item_expiry, datetime):
+                item_expiry_date = item_expiry.date()
+            elif isinstance(item_expiry, date):
+                item_expiry_date = item_expiry
+            elif item_expiry:
+                item_expiry_date = date.fromisoformat(
+                    str(item_expiry)
+                )
+            else:
+                item_expiry_date = None
+
+            if item_expiry_date != request.expiry:
+                continue
+
+            if requested_type == "FUTURE":
+                if item_type != "FUT":
+                    continue
+            else:
+                if item_type != option_type:
+                    continue
+
+                if abs(
+                    item_strike - float(request.strike)
+                ) > 0.0001:
+                    continue
+
+            matches.append(instrument)
+
+        if not matches:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    "No matching Zerodha instrument was found for "
+                    f"{symbol} {requested_type} expiring "
+                    f"{request.expiry.isoformat()}."
+                ),
+            )
+
+        if len(matches) > 1:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": (
+                        "More than one matching instrument was found"
+                    ),
+                    "count": len(matches),
+                    "matches": [
+                        serialize_instrument(item)
+                        for item in matches[:10]
+                    ],
+                },
+            )
+
+        resolved = serialize_instrument(matches[0])
+
+        return {
+            "status": "resolved",
+            "instrument": resolved,
+            "position_fields": {
+                "instrument_token": resolved.get(
+                    "instrument_token"
+                ),
+                "tradingsymbol": resolved.get(
+                    "tradingsymbol"
+                ),
+                "exchange": resolved.get("exchange"),
+                "lot_size": resolved.get("lot_size"),
+            },
+        }
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Unable to resolve Zerodha instrument: "
+                f"{str(exc)}"
+            ),
+        ) from exc
+
