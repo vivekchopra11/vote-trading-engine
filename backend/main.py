@@ -14,7 +14,7 @@ IST = ZoneInfo("Asia/Kolkata")
 
 app = FastAPI(
     title="VOTE Data Engine",
-    version="0.4.1",
+    version="0.4.2",
     description="Backend service for the Vivek Options Trading Engine",
 )
 
@@ -141,6 +141,17 @@ class ResolveInstrumentRequest(BaseModel):
     )
 
 
+class MarketQuotesRequest(BaseModel):
+    instruments: list[str] = Field(
+        min_length=1,
+        max_length=500,
+        description=(
+            "Kite instrument identifiers in EXCHANGE:TRADINGSYMBOL "
+            "format, for example NFO:NIFTY2681124600CE"
+        ),
+    )
+
+
 def serialize_instrument(
     instrument: dict[str, Any],
 ) -> dict[str, Any]:
@@ -159,7 +170,7 @@ def serialize_instrument(
 def root() -> dict[str, str]:
     return {
         "application": "VOTE Data Engine",
-        "version": "0.4.1",
+        "version": "0.4.2",
         "status": "running",
     }
 
@@ -579,3 +590,112 @@ def resolve_instrument(
             ),
         ) from exc
 
+@app.post("/market/quotes")
+def market_quotes(
+    request: MarketQuotesRequest,
+) -> dict[str, Any]:
+    """Fetch current Kite quotes for resolved instruments."""
+    try:
+        normalized_instruments: list[str] = []
+        seen: set[str] = set()
+
+        for raw_instrument in request.instruments:
+            instrument = raw_instrument.strip().upper()
+
+            if not instrument:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Instrument identifiers cannot be empty.",
+                )
+
+            if ":" not in instrument:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "Each instrument must use "
+                        "EXCHANGE:TRADINGSYMBOL format."
+                    ),
+                )
+
+            exchange, tradingsymbol = instrument.split(":", 1)
+
+            if not exchange or not tradingsymbol:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "Each instrument must include both exchange "
+                        "and tradingsymbol."
+                    ),
+                )
+
+            if instrument not in seen:
+                seen.add(instrument)
+                normalized_instruments.append(instrument)
+
+        kite = get_kite_client()
+        raw_quotes = kite.quote(normalized_instruments)
+
+        quotes: dict[str, Any] = {}
+        unresolved: list[str] = []
+
+        for instrument in normalized_instruments:
+            quote = raw_quotes.get(instrument)
+
+            if not quote:
+                unresolved.append(instrument)
+                continue
+
+            quotes[instrument] = {
+                "instrument_token": quote.get("instrument_token"),
+                "last_price": quote.get("last_price"),
+                "last_quantity": quote.get("last_quantity"),
+                "average_price": quote.get("average_price"),
+                "volume": quote.get("volume"),
+                "buy_quantity": quote.get("buy_quantity"),
+                "sell_quantity": quote.get("sell_quantity"),
+                "ohlc": quote.get("ohlc"),
+                "net_change": quote.get("net_change"),
+                "oi": quote.get("oi"),
+                "oi_day_high": quote.get("oi_day_high"),
+                "oi_day_low": quote.get("oi_day_low"),
+                "lower_circuit_limit": quote.get(
+                    "lower_circuit_limit"
+                ),
+                "upper_circuit_limit": quote.get(
+                    "upper_circuit_limit"
+                ),
+                "last_trade_time": (
+                    quote.get("last_trade_time").isoformat()
+                    if isinstance(
+                        quote.get("last_trade_time"),
+                        datetime,
+                    )
+                    else quote.get("last_trade_time")
+                ),
+                "exchange_timestamp": (
+                    quote.get("timestamp").isoformat()
+                    if isinstance(quote.get("timestamp"), datetime)
+                    else quote.get("timestamp")
+                ),
+            }
+
+        return {
+            "status": "success",
+            "requested_count": len(normalized_instruments),
+            "resolved_count": len(quotes),
+            "unresolved_count": len(unresolved),
+            "fetched_at": datetime.now(IST).isoformat(),
+            "quotes": quotes,
+            "unresolved": unresolved,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Unable to fetch Zerodha quotes: "
+                f"{str(exc)}"
+            ),
+        ) from exc
