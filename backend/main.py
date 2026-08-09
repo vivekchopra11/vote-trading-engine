@@ -14,7 +14,7 @@ IST = ZoneInfo("Asia/Kolkata")
 
 app = FastAPI(
     title="VOTE Data Engine",
-    version="0.5.0",
+    version="0.6.4",
     description="Backend service for the Vivek Options Trading Engine",
 )
 
@@ -206,6 +206,22 @@ def resolve_from_instruments(
     return matches[0]
 
 
+
+
+def underlying_quote_key(symbol: str) -> str:
+    normalized = symbol.strip().upper()
+
+    index_symbols = {
+        "NIFTY": "NSE:NIFTY 50",
+        "NIFTY50": "NSE:NIFTY 50",
+        "BANKNIFTY": "NSE:NIFTY BANK",
+        "FINNIFTY": "NSE:NIFTY FIN SERVICE",
+        "MIDCPNIFTY": "NSE:NIFTY MID SELECT",
+        "SENSEX": "BSE:SENSEX",
+    }
+
+    return index_symbols.get(normalized, f"NSE:{normalized}")
+
 def calculate_position_mtm(
     *,
     side: str,
@@ -226,7 +242,7 @@ def calculate_position_mtm(
 
 @app.get("/")
 def root() -> dict[str, str]:
-    return {"application": "VOTE Data Engine", "version": "0.5.0", "status": "running"}
+    return {"application": "VOTE Data Engine", "version": "0.6.4", "status": "running"}
 
 
 @app.get("/health")
@@ -479,7 +495,7 @@ def refresh_strategy(request: RefreshStrategyRequest) -> dict[str, Any]:
     try:
         strategy_response = (
             database.table("strategy_master")
-            .select("strategy_id,strategy_name,symbol,status,realised_pnl")
+            .select("strategy_id,strategy_name,symbol,status,realised_pnl,current_spot_price,market_data_updated_at")
             .eq("strategy_id", request.strategy_id)
             .limit(1)
             .execute()
@@ -516,6 +532,12 @@ def refresh_strategy(request: RefreshStrategyRequest) -> dict[str, Any]:
             }
 
         kite = get_kite_client()
+
+        symbol = str(strategy.get("symbol") or "").strip().upper()
+        if not symbol:
+            raise HTTPException(status_code=422, detail="Strategy has no underlying symbol.")
+
+        spot_quote_key = underlying_quote_key(symbol)
 
         needs_resolution = any(
             position.get("instrument_type") in {"OPTION", "FUTURE"}
@@ -611,7 +633,22 @@ def refresh_strategy(request: RefreshStrategyRequest) -> dict[str, Any]:
         for position_id, metadata_update in resolution_updates:
             database.table("book_positions").update(metadata_update).eq("id", position_id).execute()
 
-        raw_quotes = kite.quote(quote_keys)
+        market_quote_keys = list(dict.fromkeys([spot_quote_key, *quote_keys]))
+        raw_quotes = kite.quote(market_quote_keys)
+
+        if spot_quote_key not in raw_quotes:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Zerodha did not return an underlying quote for {spot_quote_key}.",
+            )
+
+        current_spot_price = float(raw_quotes[spot_quote_key].get("last_price") or 0)
+        if not current_spot_price or current_spot_price <= 0:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Zerodha returned an invalid underlying price for {spot_quote_key}.",
+            )
+
         unresolved_quotes = [key for key in quote_keys if key not in raw_quotes]
         if unresolved_quotes:
             raise HTTPException(
@@ -671,10 +708,14 @@ def refresh_strategy(request: RefreshStrategyRequest) -> dict[str, Any]:
         realised_pnl = float(strategy.get("realised_pnl") or 0)
         total_pnl = round(realised_pnl + total_unrealised_mtm, 2)
 
+        refreshed_at = datetime.now(IST).isoformat()
+
         database.table("strategy_master").update(
             {
                 "unrealised_mtm": total_unrealised_mtm,
                 "total_pnl": total_pnl,
+                "current_spot_price": current_spot_price,
+                "market_data_updated_at": refreshed_at,
             }
         ).eq("strategy_id", request.strategy_id).execute()
 
@@ -687,7 +728,9 @@ def refresh_strategy(request: RefreshStrategyRequest) -> dict[str, Any]:
             "realised_pnl": round(realised_pnl, 2),
             "unrealised_mtm": total_unrealised_mtm,
             "total_pnl": total_pnl,
-            "refreshed_at": datetime.now(IST).isoformat(),
+            "current_spot_price": current_spot_price,
+            "underlying_quote_key": spot_quote_key,
+            "refreshed_at": refreshed_at,
             "positions": position_results,
         }
 
