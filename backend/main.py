@@ -9,12 +9,13 @@ from fastapi.responses import RedirectResponse
 from kiteconnect import KiteConnect
 from pydantic import BaseModel, Field
 from supabase import Client, create_client
+from observation_engine import capture_strategy_observations
 
 IST = ZoneInfo("Asia/Kolkata")
 
 app = FastAPI(
     title="VOTE Data Engine",
-    version="0.7.0",
+    version="0.8.0",
     description="Backend service for the Vivek Options Trading Engine",
 )
 
@@ -957,6 +958,24 @@ def refresh_strategy(request: RefreshStrategyRequest) -> dict[str, Any]:
                 }
             ).execute()
 
+        observation_result: dict[str, Any] = {}
+        observation_warning: str | None = None
+        try:
+            observation_result = capture_strategy_observations(
+                database,
+                strategy_id=request.strategy_id,
+                captured_at=refreshed_at,
+                positions=prepared_positions,
+                current_spot_price=current_spot_price,
+                realised_pnl=realised_pnl,
+                unrealised_mtm=total_unrealised_mtm,
+                net_pnl=total_pnl,
+                margin_used=margin_used,
+            )
+        except Exception as observation_exc:
+            # Observations must never prevent the core market-data refresh.
+            observation_warning = str(observation_exc)
+
         return {
             "status": "success",
             "strategy_id": request.strategy_id,
@@ -972,6 +991,10 @@ def refresh_strategy(request: RefreshStrategyRequest) -> dict[str, Any]:
             "initial_margin": initial_margin,
             "margin_status": margin_status,
             "refreshed_at": refreshed_at,
+            "nearest_dte": observation_result.get("nearest_dte"),
+            "observations_active": observation_result.get("observations_active", 0),
+            "observation_codes": observation_result.get("observation_codes", []),
+            "observation_warning": observation_warning,
             "positions": position_results,
         }
 
