@@ -461,7 +461,7 @@ def upsert_portfolio_snapshot(
 
 @app.get("/")
 def root() -> dict[str, str]:
-    return {"application": "VOTE Data Engine", "version": "0.7.0", "status": "running"}
+    return {"application": "VOTE Data Engine", "version": "0.8.0", "status": "running"}
 
 
 @app.get("/health")
