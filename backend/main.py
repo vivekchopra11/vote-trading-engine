@@ -14,7 +14,7 @@ IST = ZoneInfo("Asia/Kolkata")
 
 app = FastAPI(
     title="VOTE Data Engine",
-    version="0.6.4",
+    version="0.7.0",
     description="Backend service for the Vivek Options Trading Engine",
 )
 
@@ -47,6 +47,15 @@ class MarketQuotesRequest(BaseModel):
 
 class RefreshStrategyRequest(BaseModel):
     strategy_id: str = Field(min_length=1)
+
+
+class PortfolioSnapshotRequest(BaseModel):
+    snapshot_date: date | None = None
+
+
+class PortfolioSettingsRequest(BaseModel):
+    deployable_capital: float = Field(gt=0)
+    target_return_pct: float = Field(gt=0, le=100)
 
 
 def get_supabase() -> Client:
@@ -240,9 +249,218 @@ def calculate_position_mtm(
     return round(mtm, 2)
 
 
+
+def build_margin_orders(positions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    orders: list[dict[str, Any]] = []
+
+    for position in positions:
+        quantity = int(float(position.get("open_quantity") or 0))
+        if quantity <= 0:
+            continue
+
+        exchange = str(position.get("exchange") or "").strip().upper()
+        tradingsymbol = str(position.get("tradingsymbol") or "").strip().upper()
+        instrument_type = str(position.get("instrument_type") or "").strip().upper()
+        side = str(position.get("position_side") or "").strip().upper()
+
+        if not exchange or not tradingsymbol or side not in {"BUY", "SELL"}:
+            continue
+
+        orders.append(
+            {
+                "exchange": exchange,
+                "tradingsymbol": tradingsymbol,
+                "transaction_type": side,
+                "variety": "regular",
+                "product": "CNC" if instrument_type == "EQUITY" else "NRML",
+                "order_type": "MARKET",
+                "quantity": quantity,
+                "price": 0,
+                "trigger_price": 0,
+            }
+        )
+
+    # Protective long legs first. This keeps the basket's initial margin realistic.
+    return sorted(orders, key=lambda order: 0 if order["transaction_type"] == "BUY" else 1)
+
+
+def calculate_strategy_margin(
+    kite: KiteConnect,
+    positions: list[dict[str, Any]],
+) -> dict[str, float | str | None]:
+    orders = build_margin_orders(positions)
+
+    if not orders:
+        return {
+            "margin_used": 0.0,
+            "initial_margin": 0.0,
+            "margin_status": "CURRENT",
+        }
+
+    try:
+        # consider_positions=False intentionally isolates this strategy so that
+        # strategies can be compared on a like-for-like capital basis.
+        response = kite.basket_order_margins(
+            orders,
+            consider_positions=False,
+            mode="compact",
+        )
+
+        initial = response.get("initial") or {}
+        final = response.get("final") or {}
+
+        return {
+            "margin_used": round(float(final.get("total") or 0), 2),
+            "initial_margin": round(float(initial.get("total") or 0), 2),
+            "margin_status": "CURRENT",
+        }
+    except Exception as exc:
+        return {
+            "margin_used": None,
+            "initial_margin": None,
+            "margin_status": f"UNAVAILABLE: {str(exc)}",
+        }
+
+
+def strategy_month_key(strategy: dict[str, Any]) -> str:
+    value = strategy.get("expiry_month") or strategy.get("entry_date")
+    if not value:
+        return datetime.now(IST).strftime("%Y-%m")
+    return str(value)[:7]
+
+
+def upsert_portfolio_snapshot(
+    database: Client,
+    snapshot_date: date,
+) -> dict[str, Any]:
+    month_key = snapshot_date.strftime("%Y-%m")
+
+    settings_response = (
+        database.table("portfolio_settings")
+        .select("deployable_capital,target_return_pct")
+        .eq("id", 1)
+        .limit(1)
+        .execute()
+    )
+    settings = settings_response.data[0] if settings_response.data else {}
+    deployable_capital = float(settings.get("deployable_capital") or 0)
+    target_return_pct = float(settings.get("target_return_pct") or 5.5)
+
+    strategies_response = (
+        database.table("strategy_master")
+        .select(
+            "strategy_id,status,entry_date,expiry_month,realised_pnl,"
+            "unrealised_mtm,total_pnl,margin_used,margin_status"
+        )
+        .execute()
+    )
+    strategies = strategies_response.data or []
+    month_strategies = [s for s in strategies if strategy_month_key(s) == month_key]
+    open_month_strategies = [s for s in month_strategies if s.get("status") != "CLOSED"]
+
+    realised_pnl = round(sum(float(s.get("realised_pnl") or 0) for s in month_strategies), 2)
+    unrealised_mtm = round(sum(float(s.get("unrealised_mtm") or 0) for s in open_month_strategies), 2)
+    net_pnl = round(realised_pnl + unrealised_mtm, 2)
+    strategy_margin_sum = round(
+        sum(
+            float(s.get("margin_used") or 0)
+            for s in open_month_strategies
+            if str(s.get("margin_status") or "").startswith("CURRENT")
+        ),
+        2,
+    )
+
+    return_on_capital_pct = (
+        round((net_pnl / deployable_capital) * 100, 4)
+        if deployable_capital > 0
+        else None
+    )
+    target_amount = (
+        round(deployable_capital * target_return_pct / 100, 2)
+        if deployable_capital > 0
+        else None
+    )
+    target_achievement_pct = (
+        round((net_pnl / target_amount) * 100, 2)
+        if target_amount and target_amount != 0
+        else None
+    )
+
+    daily_payload = {
+        "snapshot_date": snapshot_date.isoformat(),
+        "month_key": month_key,
+        "deployable_capital": deployable_capital or None,
+        "strategy_margin_sum": strategy_margin_sum,
+        "realised_pnl": realised_pnl,
+        "unrealised_mtm": unrealised_mtm,
+        "net_pnl": net_pnl,
+        "return_on_capital_pct": return_on_capital_pct,
+        "target_return_pct": target_return_pct,
+        "target_amount": target_amount,
+        "target_achievement_pct": target_achievement_pct,
+        "open_strategy_count": len(open_month_strategies),
+        "closed_strategy_count": len([s for s in month_strategies if s.get("status") == "CLOSED"]),
+        "captured_at": datetime.now(IST).isoformat(),
+    }
+
+    (
+        database.table("portfolio_daily_snapshots")
+        .upsert(daily_payload, on_conflict="snapshot_date")
+        .execute()
+    )
+
+    month_daily_response = (
+        database.table("portfolio_daily_snapshots")
+        .select("strategy_margin_sum")
+        .eq("month_key", month_key)
+        .execute()
+    )
+    margin_values = [
+        float(row.get("strategy_margin_sum") or 0)
+        for row in (month_daily_response.data or [])
+    ]
+    average_margin_used = round(sum(margin_values) / len(margin_values), 2) if margin_values else 0.0
+    peak_margin_used = round(max(margin_values), 2) if margin_values else 0.0
+    return_on_avg_margin_pct = (
+        round((net_pnl / average_margin_used) * 100, 4)
+        if average_margin_used > 0
+        else None
+    )
+
+    monthly_payload = {
+        "month_key": month_key,
+        "deployable_capital": deployable_capital or None,
+        "closing_margin_used": strategy_margin_sum,
+        "average_margin_used": average_margin_used,
+        "peak_margin_used": peak_margin_used,
+        "realised_pnl": realised_pnl,
+        "closing_unrealised_mtm": unrealised_mtm,
+        "net_pnl": net_pnl,
+        "return_on_capital_pct": return_on_capital_pct,
+        "return_on_avg_margin_pct": return_on_avg_margin_pct,
+        "target_return_pct": target_return_pct,
+        "target_amount": target_amount,
+        "target_achievement_pct": target_achievement_pct,
+        "updated_at": datetime.now(IST).isoformat(),
+    }
+
+    (
+        database.table("portfolio_monthly_summary")
+        .upsert(monthly_payload, on_conflict="month_key")
+        .execute()
+    )
+
+    return {
+        **daily_payload,
+        "average_margin_used": average_margin_used,
+        "peak_margin_used": peak_margin_used,
+        "return_on_avg_margin_pct": return_on_avg_margin_pct,
+    }
+
+
 @app.get("/")
 def root() -> dict[str, str]:
-    return {"application": "VOTE Data Engine", "version": "0.6.4", "status": "running"}
+    return {"application": "VOTE Data Engine", "version": "0.7.0", "status": "running"}
 
 
 @app.get("/health")
@@ -495,7 +713,7 @@ def refresh_strategy(request: RefreshStrategyRequest) -> dict[str, Any]:
     try:
         strategy_response = (
             database.table("strategy_master")
-            .select("strategy_id,strategy_name,symbol,status,realised_pnl,current_spot_price,market_data_updated_at")
+            .select("strategy_id,strategy_name,symbol,status,realised_pnl,current_spot_price,market_data_updated_at,margin_used,margin_status")
             .eq("strategy_id", request.strategy_id)
             .limit(1)
             .execute()
@@ -708,6 +926,11 @@ def refresh_strategy(request: RefreshStrategyRequest) -> dict[str, Any]:
         realised_pnl = float(strategy.get("realised_pnl") or 0)
         total_pnl = round(realised_pnl + total_unrealised_mtm, 2)
 
+        margin_result = calculate_strategy_margin(kite, prepared_positions)
+        margin_used = margin_result.get("margin_used")
+        initial_margin = margin_result.get("initial_margin")
+        margin_status = str(margin_result.get("margin_status") or "UNAVAILABLE")
+
         refreshed_at = datetime.now(IST).isoformat()
 
         database.table("strategy_master").update(
@@ -716,8 +939,23 @@ def refresh_strategy(request: RefreshStrategyRequest) -> dict[str, Any]:
                 "total_pnl": total_pnl,
                 "current_spot_price": current_spot_price,
                 "market_data_updated_at": refreshed_at,
+                "margin_used": margin_used,
+                "margin_initial": initial_margin,
+                "margin_status": margin_status,
+                "margin_updated_at": refreshed_at,
             }
         ).eq("strategy_id", request.strategy_id).execute()
+
+        if margin_used is not None:
+            database.table("strategy_margin_history").insert(
+                {
+                    "strategy_id": request.strategy_id,
+                    "captured_at": refreshed_at,
+                    "margin_used": margin_used,
+                    "initial_margin": initial_margin,
+                    "source": "MARKET_REFRESH",
+                }
+            ).execute()
 
         return {
             "status": "success",
@@ -730,6 +968,9 @@ def refresh_strategy(request: RefreshStrategyRequest) -> dict[str, Any]:
             "total_pnl": total_pnl,
             "current_spot_price": current_spot_price,
             "underlying_quote_key": spot_quote_key,
+            "margin_used": margin_used,
+            "initial_margin": initial_margin,
+            "margin_status": margin_status,
             "refreshed_at": refreshed_at,
             "positions": position_results,
         }
@@ -741,3 +982,78 @@ def refresh_strategy(request: RefreshStrategyRequest) -> dict[str, Any]:
             status_code=500,
             detail=f"Unable to refresh strategy market data: {str(exc)}",
         ) from exc
+
+
+@app.post("/portfolio/settings")
+def update_portfolio_settings(request: PortfolioSettingsRequest) -> dict[str, Any]:
+    database = get_supabase()
+    payload = {
+        "id": 1,
+        "deployable_capital": round(request.deployable_capital, 2),
+        "target_return_pct": round(request.target_return_pct, 4),
+        "updated_at": datetime.now(IST).isoformat(),
+    }
+    database.table("portfolio_settings").upsert(payload, on_conflict="id").execute()
+    return {"status": "success", **payload}
+
+
+@app.post("/portfolio/snapshot")
+def portfolio_snapshot(request: PortfolioSnapshotRequest) -> dict[str, Any]:
+    database = get_supabase()
+    snapshot_date = request.snapshot_date or datetime.now(IST).date()
+    try:
+        result = upsert_portfolio_snapshot(database, snapshot_date)
+        return {"status": "success", "snapshot": result}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unable to save portfolio snapshot: {str(exc)}",
+        ) from exc
+
+
+@app.get("/portfolio/intelligence")
+def portfolio_intelligence() -> dict[str, Any]:
+    database = get_supabase()
+    settings_response = (
+        database.table("portfolio_settings")
+        .select("deployable_capital,target_return_pct,updated_at")
+        .eq("id", 1)
+        .limit(1)
+        .execute()
+    )
+    monthly_response = (
+        database.table("portfolio_monthly_summary")
+        .select("*")
+        .order("month_key", desc=True)
+        .execute()
+    )
+    strategies_response = (
+        database.table("strategy_master")
+        .select(
+            "strategy_id,strategy_name,symbol,status,entry_date,expiry_month,"
+            "realised_pnl,unrealised_mtm,total_pnl,margin_used,margin_status,margin_updated_at"
+        )
+        .eq("status", "OPEN")
+        .execute()
+    )
+
+    strategies = []
+    for strategy in strategies_response.data or []:
+        margin = float(strategy.get("margin_used") or 0)
+        net = float(strategy.get("total_pnl") or 0)
+        strategy["return_on_margin_pct"] = round((net / margin) * 100, 4) if margin > 0 else None
+        strategies.append(strategy)
+
+    strategies.sort(
+        key=lambda item: item.get("return_on_margin_pct") if item.get("return_on_margin_pct") is not None else -10**9,
+        reverse=True,
+    )
+
+    return {
+        "status": "success",
+        "settings": settings_response.data[0] if settings_response.data else None,
+        "monthly": monthly_response.data or [],
+        "strategies": strategies,
+    }
