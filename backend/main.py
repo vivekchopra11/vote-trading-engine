@@ -925,6 +925,142 @@ def refresh_strategy(request: RefreshStrategyRequest) -> dict[str, Any]:
         ) from exc
 
 
+@app.post("/strategy/recalculate-margin")
+def recalculate_strategy_margin(request: RefreshStrategyRequest) -> dict[str, Any]:
+    """Recalculate margin only when a strategy position event changes open legs."""
+    database = get_supabase()
+
+    strategy_response = (
+        database.table("strategy_master")
+        .select("strategy_id,status")
+        .eq("strategy_id", request.strategy_id)
+        .limit(1)
+        .execute()
+    )
+    if not strategy_response.data:
+        raise HTTPException(status_code=404, detail="Strategy not found.")
+
+    positions_response = (
+        database.table("book_positions")
+        .select(
+            "id,symbol,instrument_type,option_type,strike,expiry_date,position_side,"
+            "open_quantity,exchange,tradingsymbol,instrument_token,lot_size"
+        )
+        .eq("strategy_id", request.strategy_id)
+        .gt("open_quantity", 0)
+        .execute()
+    )
+    positions = positions_response.data or []
+    captured_at = datetime.now(IST).isoformat()
+
+    if not positions:
+        database.table("strategy_master").update(
+            {
+                "margin_used": 0,
+                "margin_initial": 0,
+                "margin_status": "CURRENT",
+                "margin_updated_at": captured_at,
+            }
+        ).eq("strategy_id", request.strategy_id).execute()
+        return {
+            "status": "success",
+            "strategy_id": request.strategy_id,
+            "margin_used": 0,
+            "initial_margin": 0,
+            "margin_status": "CURRENT",
+            "captured_at": captured_at,
+        }
+
+    kite = get_kite_client()
+    needs_resolution = any(
+        str(p.get("instrument_type") or "").upper() in {"OPTION", "FUTURE"}
+        and (not p.get("tradingsymbol") or not p.get("instrument_token"))
+        for p in positions
+    )
+    nfo_instruments = kite.instruments("NFO") if needs_resolution else []
+    prepared_positions: list[dict[str, Any]] = []
+
+    for position in positions:
+        instrument_type = str(position.get("instrument_type") or "").upper()
+        exchange = str(position.get("exchange") or "").upper()
+        tradingsymbol = position.get("tradingsymbol")
+        instrument_token = position.get("instrument_token")
+        lot_size = position.get("lot_size")
+
+        if instrument_type in {"OPTION", "FUTURE"} and (not tradingsymbol or not instrument_token):
+            expiry = parse_date_value(position.get("expiry_date"))
+            if not expiry:
+                raise HTTPException(status_code=422, detail=f"Position {position['id']} has no expiry date.")
+            resolved = resolve_from_instruments(
+                nfo_instruments,
+                symbol=str(position.get("symbol") or "").upper(),
+                instrument_type=instrument_type,
+                expiry=expiry,
+                strike=float(position["strike"]) if position.get("strike") is not None else None,
+                option_type=position.get("option_type"),
+            )
+            tradingsymbol = resolved.get("tradingsymbol")
+            instrument_token = resolved.get("instrument_token")
+            exchange = str(resolved.get("exchange") or "NFO").upper()
+            lot_size = resolved.get("lot_size")
+            database.table("book_positions").update(
+                {
+                    "tradingsymbol": tradingsymbol,
+                    "instrument_token": instrument_token,
+                    "exchange": exchange,
+                    "lot_size": lot_size,
+                }
+            ).eq("id", position["id"]).execute()
+
+        if instrument_type == "EQUITY":
+            exchange = exchange or "NSE"
+            tradingsymbol = tradingsymbol or str(position.get("symbol") or "").upper()
+
+        prepared_positions.append(
+            {
+                **position,
+                "exchange": exchange,
+                "tradingsymbol": tradingsymbol,
+                "instrument_token": instrument_token,
+                "lot_size": lot_size,
+            }
+        )
+
+    margin_result = calculate_strategy_margin(kite, prepared_positions)
+    margin_used = margin_result.get("margin_used")
+    initial_margin = margin_result.get("initial_margin")
+    margin_status = str(margin_result.get("margin_status") or "UNAVAILABLE")
+
+    database.table("strategy_master").update(
+        {
+            "margin_used": margin_used,
+            "margin_initial": initial_margin,
+            "margin_status": margin_status,
+            "margin_updated_at": captured_at,
+        }
+    ).eq("strategy_id", request.strategy_id).execute()
+
+    if margin_used is not None:
+        database.table("strategy_margin_history").insert(
+            {
+                "strategy_id": request.strategy_id,
+                "captured_at": captured_at,
+                "margin_used": margin_used,
+                "initial_margin": initial_margin,
+                "source": "POSITION_EVENT",
+            }
+        ).execute()
+
+    return {
+        "status": "success",
+        "strategy_id": request.strategy_id,
+        "margin_used": margin_used,
+        "initial_margin": initial_margin,
+        "margin_status": margin_status,
+        "captured_at": captured_at,
+    }
+
+
 @app.post("/portfolio/settings")
 def update_portfolio_settings(request: PortfolioSettingsRequest) -> dict[str, Any]:
     database = get_supabase()
