@@ -1,3 +1,4 @@
+import time
 import os
 from datetime import date, datetime, time, timedelta
 from typing import Any
@@ -628,111 +629,79 @@ def market_instruments(
         raise HTTPException(status_code=502, detail=f"Unable to fetch Zerodha instruments: {str(exc)}") from exc
 
 
-@app.post("/market/resolve-instrument")
-def market_resolve_instrument(request: ResolveInstrumentRequest) -> dict[str, Any]:
-    try:
-        kite = get_kite_client()
-        instruments = kite.instruments("NFO")
-        instrument = resolve_from_instruments(
-            instruments,
-            symbol=request.symbol,
-            instrument_type=request.instrument_type,
-            expiry=request.expiry,
-            strike=request.strike,
-            option_type=request.option_type,
-        )
-        return {
-            "status": "resolved",
-            "instrument": serialize_instrument(instrument),
-            "position_fields": {
-                "instrument_token": instrument.get("instrument_token"),
-                "tradingsymbol": instrument.get("tradingsymbol"),
-                "exchange": instrument.get("exchange"),
-                "lot_size": instrument.get("lot_size"),
-            },
-        }
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Unable to resolve Zerodha instrument: {str(exc)}") from exc
-
-
-@app.post("/market/quotes")
-def market_quotes(request: MarketQuotesRequest) -> dict[str, Any]:
-    try:
-        kite = get_kite_client()
-        requested = [item.strip().upper() for item in request.instruments if item.strip()]
-        if not requested:
-            raise HTTPException(status_code=422, detail="At least one instrument is required.")
-
-        raw_quotes = kite.quote(requested)
-        quotes: dict[str, Any] = {}
-        for key, quote in raw_quotes.items():
-            quotes[key] = {
-                "instrument_token": quote.get("instrument_token"),
-                "last_price": quote.get("last_price"),
-                "last_quantity": quote.get("last_quantity"),
-                "average_price": quote.get("average_price"),
-                "volume": quote.get("volume"),
-                "buy_quantity": quote.get("buy_quantity"),
-                "sell_quantity": quote.get("sell_quantity"),
-                "ohlc": quote.get("ohlc"),
-                "net_change": quote.get("net_change"),
-                "oi": quote.get("oi"),
-                "oi_day_high": quote.get("oi_day_high"),
-                "oi_day_low": quote.get("oi_day_low"),
-                "lower_circuit_limit": quote.get("lower_circuit_limit"),
-                "upper_circuit_limit": quote.get("upper_circuit_limit"),
-                "last_trade_time": quote.get("last_trade_time").isoformat()
-                if isinstance(quote.get("last_trade_time"), datetime)
-                else quote.get("last_trade_time"),
-                "exchange_timestamp": quote.get("timestamp").isoformat()
-                if isinstance(quote.get("timestamp"), datetime)
-                else quote.get("timestamp"),
-            }
-
-        unresolved = [item for item in requested if item not in raw_quotes]
-        return {
-            "status": "success",
-            "requested_count": len(requested),
-            "resolved_count": len(quotes),
-            "unresolved_count": len(unresolved),
-            "fetched_at": datetime.now(IST).isoformat(),
-            "quotes": quotes,
-            "unresolved": unresolved,
-        }
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Unable to fetch Zerodha quotes: {str(exc)}") from exc
-
-
 @app.post("/market/refresh-strategy")
 def refresh_strategy(request: RefreshStrategyRequest) -> dict[str, Any]:
     database = get_supabase()
 
+    refresh_started = time.perf_counter()
+    checkpoint_started = refresh_started
+
+    def checkpoint(label: str) -> None:
+        nonlocal checkpoint_started
+
+        now = time.perf_counter()
+
+        print(
+            f"[REFRESH TIMING] "
+            f"{request.strategy_id} | "
+            f"{label}: "
+            f"{now - checkpoint_started:.3f}s | "
+            f"total={now - refresh_started:.3f}s",
+            flush=True,
+        )
+
+        checkpoint_started = now
+
     try:
+        # ---------------------------------------------------------
+        # 01. Load strategy
+        # ---------------------------------------------------------
+
         strategy_response = (
             database.table("strategy_master")
-            .select("strategy_id,strategy_name,symbol,status,realised_pnl,current_spot_price,market_data_updated_at,margin_used,margin_status")
+            .select(
+                "strategy_id,strategy_name,symbol,status,"
+                "realised_pnl,current_spot_price,"
+                "market_data_updated_at,margin_used,margin_status"
+            )
             .eq("strategy_id", request.strategy_id)
             .limit(1)
             .execute()
         )
 
         if not strategy_response.data:
-            raise HTTPException(status_code=404, detail="Strategy not found.")
+            raise HTTPException(
+                status_code=404,
+                detail="Strategy not found.",
+            )
 
         strategy = strategy_response.data[0]
+
+        checkpoint("01 strategy loaded")
+
         if strategy.get("status") == "CLOSED":
-            raise HTTPException(status_code=409, detail="Closed strategies do not require market-price refresh.")
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Closed strategies do not require "
+                    "market-price refresh."
+                ),
+            )
+
+        # ---------------------------------------------------------
+        # 02. Load open positions
+        # ---------------------------------------------------------
 
         positions_response = (
             database.table("book_positions")
             .select(
-                "id,strategy_id,symbol,instrument_type,option_type,strike,expiry_date,"
-                "position_side,open_quantity,quantity,entry_price,current_price,"
-                "contract_multiplier,exchange,tradingsymbol,instrument_token,lot_size,mtm"
+                "id,strategy_id,symbol,instrument_type,"
+                "option_type,strike,expiry_date,"
+                "position_side,open_quantity,quantity,"
+                "entry_price,current_price,"
+                "contract_multiplier,exchange,"
+                "tradingsymbol,instrument_token,"
+                "lot_size,mtm"
             )
             .eq("strategy_id", request.strategy_id)
             .gt("open_quantity", 0)
@@ -740,78 +709,164 @@ def refresh_strategy(request: RefreshStrategyRequest) -> dict[str, Any]:
         )
 
         positions = positions_response.data or []
+
+        checkpoint("02 positions loaded")
+
         if not positions:
+            checkpoint("refresh complete - no positions")
+
             return {
                 "status": "no_open_positions",
                 "strategy_id": request.strategy_id,
                 "positions_updated": 0,
                 "unrealised_mtm": 0,
-                "message": "No open position quantities were found for this strategy.",
+                "message": (
+                    "No open position quantities were "
+                    "found for this strategy."
+                ),
                 "refreshed_at": datetime.now(IST).isoformat(),
             }
 
+        # ---------------------------------------------------------
+        # Zerodha client
+        # ---------------------------------------------------------
+
         kite = get_kite_client()
 
-        symbol = str(strategy.get("symbol") or "").strip().upper()
+        symbol = str(
+            strategy.get("symbol") or ""
+        ).strip().upper()
+
         if not symbol:
-            raise HTTPException(status_code=422, detail="Strategy has no underlying symbol.")
+            raise HTTPException(
+                status_code=422,
+                detail="Strategy has no underlying symbol.",
+            )
 
         spot_quote_key = underlying_quote_key(symbol)
 
+        # ---------------------------------------------------------
+        # 03. Determine whether instrument resolution is required
+        # ---------------------------------------------------------
+
         needs_resolution = any(
-            position.get("instrument_type") in {"OPTION", "FUTURE"}
-            and (not position.get("tradingsymbol") or not position.get("instrument_token"))
+            position.get("instrument_type")
+            in {"OPTION", "FUTURE"}
+            and (
+                not position.get("tradingsymbol")
+                or not position.get("instrument_token")
+            )
             for position in positions
         )
 
-        nfo_instruments: list[dict[str, Any]] = kite.instruments("NFO") if needs_resolution else []
+        nfo_instruments: list[dict[str, Any]] = (
+            kite.instruments("NFO")
+            if needs_resolution
+            else []
+        )
+
+        checkpoint("03 NFO instruments loaded")
+
         quote_keys: list[str] = []
         prepared_positions: list[dict[str, Any]] = []
-        resolution_updates: list[tuple[int, dict[str, Any]]] = []
+        resolution_updates: list[
+            tuple[int, dict[str, Any]]
+        ] = []
+
+        # ---------------------------------------------------------
+        # 04. Resolve/prep instruments
+        # ---------------------------------------------------------
 
         for position in positions:
             position_id = int(position["id"])
-            instrument_type = str(position.get("instrument_type") or "").strip().upper()
-            exchange = str(position.get("exchange") or "").strip().upper()
+
+            instrument_type = str(
+                position.get("instrument_type") or ""
+            ).strip().upper()
+
+            exchange = str(
+                position.get("exchange") or ""
+            ).strip().upper()
+
             tradingsymbol = position.get("tradingsymbol")
-            instrument_token = position.get("instrument_token")
+            instrument_token = position.get(
+                "instrument_token"
+            )
             lot_size = position.get("lot_size")
 
             if instrument_type in {"OPTION", "FUTURE"}:
-                if not tradingsymbol or not instrument_token:
-                    expiry = parse_date_value(position.get("expiry_date"))
+                if (
+                    not tradingsymbol
+                    or not instrument_token
+                ):
+                    expiry = parse_date_value(
+                        position.get("expiry_date")
+                    )
+
                     if not expiry:
                         raise HTTPException(
                             status_code=422,
-                            detail=f"Position {position_id} has no expiry_date and cannot be resolved.",
+                            detail=(
+                                f"Position {position_id} "
+                                "has no expiry_date and "
+                                "cannot be resolved."
+                            ),
                         )
 
-                    symbol = str(position.get("symbol") or strategy.get("symbol") or "").strip().upper()
-                    if not symbol:
-                        raise HTTPException(status_code=422, detail=f"Position {position_id} has no underlying symbol.")
+                    position_symbol = str(
+                        position.get("symbol")
+                        or strategy.get("symbol")
+                        or ""
+                    ).strip().upper()
+
+                    if not position_symbol:
+                        raise HTTPException(
+                            status_code=422,
+                            detail=(
+                                f"Position {position_id} "
+                                "has no underlying symbol."
+                            ),
+                        )
 
                     resolved = resolve_from_instruments(
                         nfo_instruments,
-                        symbol=symbol,
+                        symbol=position_symbol,
                         instrument_type=instrument_type,
                         expiry=expiry,
-                        strike=float(position["strike"]) if position.get("strike") is not None else None,
-                        option_type=position.get("option_type"),
+                        strike=(
+                            float(position["strike"])
+                            if position.get("strike")
+                            is not None
+                            else None
+                        ),
+                        option_type=position.get(
+                            "option_type"
+                        ),
                     )
 
-                    tradingsymbol = resolved.get("tradingsymbol")
-                    instrument_token = resolved.get("instrument_token")
-                    exchange = str(resolved.get("exchange") or "NFO").upper()
+                    tradingsymbol = resolved.get(
+                        "tradingsymbol"
+                    )
+                    instrument_token = resolved.get(
+                        "instrument_token"
+                    )
+                    exchange = str(
+                        resolved.get("exchange") or "NFO"
+                    ).upper()
                     lot_size = resolved.get("lot_size")
 
                     resolution_updates.append(
                         (
                             position_id,
                             {
-                                "instrument_token": instrument_token,
-                                "tradingsymbol": tradingsymbol,
-                                "exchange": exchange,
-                                "lot_size": lot_size,
+                                "instrument_token":
+                                    instrument_token,
+                                "tradingsymbol":
+                                    tradingsymbol,
+                                "exchange":
+                                    exchange,
+                                "lot_size":
+                                    lot_size,
                             },
                         )
                     )
@@ -821,192 +876,490 @@ def refresh_strategy(request: RefreshStrategyRequest) -> dict[str, Any]:
 
             elif instrument_type == "EQUITY":
                 if not tradingsymbol:
-                    tradingsymbol = str(position.get("symbol") or strategy.get("symbol") or "").strip().upper()
+                    tradingsymbol = str(
+                        position.get("symbol")
+                        or strategy.get("symbol")
+                        or ""
+                    ).strip().upper()
+
                 if not exchange:
                     exchange = "NSE"
+
             else:
                 raise HTTPException(
                     status_code=422,
-                    detail=f"Position {position_id} has unsupported instrument_type {instrument_type!r}.",
+                    detail=(
+                        f"Position {position_id} has "
+                        "unsupported instrument_type "
+                        f"{instrument_type!r}."
+                    ),
                 )
 
             if not tradingsymbol or not exchange:
                 raise HTTPException(
                     status_code=422,
-                    detail=f"Position {position_id} does not have enough instrument metadata for a quote.",
+                    detail=(
+                        f"Position {position_id} does not "
+                        "have enough instrument metadata "
+                        "for a quote."
+                    ),
                 )
 
-            quote_key = f"{exchange}:{tradingsymbol}"
+            quote_key = (
+                f"{exchange}:{tradingsymbol}"
+            )
+
             quote_keys.append(quote_key)
+
             prepared_positions.append(
                 {
                     **position,
                     "exchange": exchange,
                     "tradingsymbol": tradingsymbol,
-                    "instrument_token": instrument_token,
+                    "instrument_token":
+                        instrument_token,
                     "lot_size": lot_size,
                     "_quote_key": quote_key,
                 }
             )
 
-        for position_id, metadata_update in resolution_updates:
-            database.table("book_positions").update(metadata_update).eq("id", position_id).execute()
+        checkpoint("04 instruments resolved")
 
-        market_quote_keys = list(dict.fromkeys([spot_quote_key, *quote_keys]))
-        raw_quotes = kite.quote(market_quote_keys)
+        # ---------------------------------------------------------
+        # 05. Save newly resolved metadata
+        # ---------------------------------------------------------
+
+        for (
+            position_id,
+            metadata_update,
+        ) in resolution_updates:
+            (
+                database.table("book_positions")
+                .update(metadata_update)
+                .eq("id", position_id)
+                .execute()
+            )
+
+        checkpoint("05 instrument metadata saved")
+
+        # ---------------------------------------------------------
+        # 06. Fetch Zerodha quotes
+        # ---------------------------------------------------------
+
+        market_quote_keys = list(
+            dict.fromkeys(
+                [spot_quote_key, *quote_keys]
+            )
+        )
+
+        raw_quotes = kite.quote(
+            market_quote_keys
+        )
+
+        checkpoint("06 Zerodha quotes fetched")
 
         if spot_quote_key not in raw_quotes:
             raise HTTPException(
                 status_code=502,
-                detail=f"Zerodha did not return an underlying quote for {spot_quote_key}.",
+                detail=(
+                    "Zerodha did not return an "
+                    "underlying quote for "
+                    f"{spot_quote_key}."
+                ),
             )
 
-        current_spot_price = float(raw_quotes[spot_quote_key].get("last_price") or 0)
-        if not current_spot_price or current_spot_price <= 0:
+        current_spot_price = float(
+            raw_quotes[
+                spot_quote_key
+            ].get("last_price")
+            or 0
+        )
+
+        if (
+            not current_spot_price
+            or current_spot_price <= 0
+        ):
             raise HTTPException(
                 status_code=502,
-                detail=f"Zerodha returned an invalid underlying price for {spot_quote_key}.",
+                detail=(
+                    "Zerodha returned an invalid "
+                    "underlying price for "
+                    f"{spot_quote_key}."
+                ),
             )
 
-        unresolved_quotes = [key for key in quote_keys if key not in raw_quotes]
+        unresolved_quotes = [
+            key
+            for key in quote_keys
+            if key not in raw_quotes
+        ]
+
         if unresolved_quotes:
             raise HTTPException(
                 status_code=502,
                 detail={
-                    "message": "Zerodha did not return quotes for all open positions.",
-                    "unresolved": unresolved_quotes,
+                    "message": (
+                        "Zerodha did not return quotes "
+                        "for all open positions."
+                    ),
+                    "unresolved":
+                        unresolved_quotes,
                 },
             )
 
-        position_results: list[dict[str, Any]] = []
+        # ---------------------------------------------------------
+        # 07. Calculate and save position MTM
+        # ---------------------------------------------------------
+
+        position_results: list[
+            dict[str, Any]
+        ] = []
+
         total_unrealised_mtm = 0.0
 
         for position in prepared_positions:
-            quote = raw_quotes[position["_quote_key"]]
-            current_price = float(quote.get("last_price"))
-            entry_price = float(position.get("entry_price") or 0)
-            open_quantity = float(position.get("open_quantity") or 0)
-            contract_multiplier = float(position.get("contract_multiplier") or 1)
+            quote = raw_quotes[
+                position["_quote_key"]
+            ]
+
+            current_price = float(
+                quote.get("last_price")
+            )
+
+            entry_price = float(
+                position.get("entry_price") or 0
+            )
+
+            open_quantity = float(
+                position.get("open_quantity") or 0
+            )
+
+            contract_multiplier = float(
+                position.get(
+                    "contract_multiplier"
+                )
+                or 1
+            )
 
             mtm = calculate_position_mtm(
-                side=str(position.get("position_side") or ""),
+                side=str(
+                    position.get(
+                        "position_side"
+                    )
+                    or ""
+                ),
                 entry_price=entry_price,
                 current_price=current_price,
                 open_quantity=open_quantity,
-                contract_multiplier=contract_multiplier,
+                contract_multiplier=
+                    contract_multiplier,
             )
 
             update_payload = {
-                "current_price": current_price,
-                "mtm": mtm,
-                "instrument_token": position.get("instrument_token"),
-                "tradingsymbol": position.get("tradingsymbol"),
-                "exchange": position.get("exchange"),
-                "lot_size": position.get("lot_size"),
+                "current_price":
+                    current_price,
+                "mtm":
+                    mtm,
+                "instrument_token":
+                    position.get(
+                        "instrument_token"
+                    ),
+                "tradingsymbol":
+                    position.get(
+                        "tradingsymbol"
+                    ),
+                "exchange":
+                    position.get(
+                        "exchange"
+                    ),
+                "lot_size":
+                    position.get(
+                        "lot_size"
+                    ),
             }
 
-            database.table("book_positions").update(update_payload).eq("id", position["id"]).execute()
+            (
+                database.table("book_positions")
+                .update(update_payload)
+                .eq("id", position["id"])
+                .execute()
+            )
+
             total_unrealised_mtm += mtm
 
             position_results.append(
                 {
-                    "position_id": position["id"],
-                    "instrument_type": position.get("instrument_type"),
-                    "tradingsymbol": position.get("tradingsymbol"),
-                    "instrument_token": position.get("instrument_token"),
-                    "entry_price": entry_price,
-                    "current_price": current_price,
-                    "open_quantity": open_quantity,
-                    "contract_multiplier": contract_multiplier,
-                    "lot_size": position.get("lot_size"),
-                    "mtm": mtm,
+                    "position_id":
+                        position["id"],
+                    "instrument_type":
+                        position.get(
+                            "instrument_type"
+                        ),
+                    "tradingsymbol":
+                        position.get(
+                            "tradingsymbol"
+                        ),
+                    "instrument_token":
+                        position.get(
+                            "instrument_token"
+                        ),
+                    "entry_price":
+                        entry_price,
+                    "current_price":
+                        current_price,
+                    "open_quantity":
+                        open_quantity,
+                    "contract_multiplier":
+                        contract_multiplier,
+                    "lot_size":
+                        position.get(
+                            "lot_size"
+                        ),
+                    "mtm":
+                        mtm,
                 }
             )
 
-        total_unrealised_mtm = round(total_unrealised_mtm, 2)
-        realised_pnl = float(strategy.get("realised_pnl") or 0)
-        total_pnl = round(realised_pnl + total_unrealised_mtm, 2)
+        checkpoint(
+            "07 positions MTM calculated and saved"
+        )
 
-        margin_result = calculate_strategy_margin(kite, prepared_positions)
-        margin_used = margin_result.get("margin_used")
-        initial_margin = margin_result.get("initial_margin")
-        margin_status = str(margin_result.get("margin_status") or "UNAVAILABLE")
+        total_unrealised_mtm = round(
+            total_unrealised_mtm,
+            2,
+        )
 
-        refreshed_at = datetime.now(IST).isoformat()
+        realised_pnl = float(
+            strategy.get("realised_pnl")
+            or 0
+        )
 
-        database.table("strategy_master").update(
-            {
-                "unrealised_mtm": total_unrealised_mtm,
-                "total_pnl": total_pnl,
-                "current_spot_price": current_spot_price,
-                "market_data_updated_at": refreshed_at,
-                "margin_used": margin_used,
-                "margin_initial": initial_margin,
-                "margin_status": margin_status,
-                "margin_updated_at": refreshed_at,
-            }
-        ).eq("strategy_id", request.strategy_id).execute()
+        total_pnl = round(
+            realised_pnl
+            + total_unrealised_mtm,
+            2,
+        )
+
+        # ---------------------------------------------------------
+        # 08. Zerodha margin
+        # ---------------------------------------------------------
+
+        margin_result = (
+            calculate_strategy_margin(
+                kite,
+                prepared_positions,
+            )
+        )
+
+        checkpoint(
+            "08 Zerodha margin calculated"
+        )
+
+        margin_used = margin_result.get(
+            "margin_used"
+        )
+
+        initial_margin = margin_result.get(
+            "initial_margin"
+        )
+
+        margin_status = str(
+            margin_result.get(
+                "margin_status"
+            )
+            or "UNAVAILABLE"
+        )
+
+        refreshed_at = (
+            datetime.now(IST).isoformat()
+        )
+
+        # ---------------------------------------------------------
+        # 09. Save strategy totals
+        # ---------------------------------------------------------
+
+        (
+            database.table(
+                "strategy_master"
+            )
+            .update(
+                {
+                    "unrealised_mtm":
+                        total_unrealised_mtm,
+                    "total_pnl":
+                        total_pnl,
+                    "current_spot_price":
+                        current_spot_price,
+                    "market_data_updated_at":
+                        refreshed_at,
+                    "margin_used":
+                        margin_used,
+                    "margin_initial":
+                        initial_margin,
+                    "margin_status":
+                        margin_status,
+                    "margin_updated_at":
+                        refreshed_at,
+                }
+            )
+            .eq(
+                "strategy_id",
+                request.strategy_id,
+            )
+            .execute()
+        )
+
+        checkpoint(
+            "09 strategy totals saved"
+        )
+
+        # ---------------------------------------------------------
+        # 10. Save margin history
+        # ---------------------------------------------------------
 
         if margin_used is not None:
-            database.table("strategy_margin_history").insert(
-                {
-                    "strategy_id": request.strategy_id,
-                    "captured_at": refreshed_at,
-                    "margin_used": margin_used,
-                    "initial_margin": initial_margin,
-                    "source": "MARKET_REFRESH",
-                }
-            ).execute()
-
-        observation_result: dict[str, Any] = {}
-        observation_warning: str | None = None
-        try:
-            observation_result = capture_strategy_observations(
-                database,
-                strategy_id=request.strategy_id,
-                captured_at=refreshed_at,
-                positions=prepared_positions,
-                current_spot_price=current_spot_price,
-                realised_pnl=realised_pnl,
-                unrealised_mtm=total_unrealised_mtm,
-                net_pnl=total_pnl,
-                margin_used=margin_used,
+            (
+                database.table(
+                    "strategy_margin_history"
+                )
+                .insert(
+                    {
+                        "strategy_id":
+                            request.strategy_id,
+                        "captured_at":
+                            refreshed_at,
+                        "margin_used":
+                            margin_used,
+                        "initial_margin":
+                            initial_margin,
+                        "source":
+                            "MARKET_REFRESH",
+                    }
+                )
+                .execute()
             )
+
+        checkpoint(
+            "10 margin history saved"
+        )
+
+        # ---------------------------------------------------------
+        # 11. Observation Engine
+        # ---------------------------------------------------------
+
+        observation_result: dict[
+            str,
+            Any,
+        ] = {}
+
+        observation_warning: (
+            str | None
+        ) = None
+
+        try:
+            observation_result = (
+                capture_strategy_observations(
+                    database,
+                    strategy_id=
+                        request.strategy_id,
+                    captured_at=
+                        refreshed_at,
+                    positions=
+                        prepared_positions,
+                    current_spot_price=
+                        current_spot_price,
+                    realised_pnl=
+                        realised_pnl,
+                    unrealised_mtm=
+                        total_unrealised_mtm,
+                    net_pnl=
+                        total_pnl,
+                    margin_used=
+                        margin_used,
+                )
+            )
+
         except Exception as observation_exc:
-            # Observations must never prevent the core market-data refresh.
-            observation_warning = str(observation_exc)
+            # Observations must never prevent
+            # the core market-data refresh.
+            observation_warning = str(
+                observation_exc
+            )
+
+        checkpoint(
+            "11 observations generated"
+        )
+
+        # ---------------------------------------------------------
+        # Complete
+        # ---------------------------------------------------------
+
+        checkpoint(
+            "12 refresh complete"
+        )
 
         return {
-            "status": "success",
-            "strategy_id": request.strategy_id,
-            "strategy_name": strategy.get("strategy_name"),
-            "positions_updated": len(position_results),
-            "positions_resolved": len(resolution_updates),
-            "realised_pnl": round(realised_pnl, 2),
-            "unrealised_mtm": total_unrealised_mtm,
-            "total_pnl": total_pnl,
-            "current_spot_price": current_spot_price,
-            "underlying_quote_key": spot_quote_key,
-            "margin_used": margin_used,
-            "initial_margin": initial_margin,
-            "margin_status": margin_status,
-            "refreshed_at": refreshed_at,
-            "nearest_dte": observation_result.get("nearest_dte"),
-            "observations_active": observation_result.get("observations_active", 0),
-            "observation_codes": observation_result.get("observation_codes", []),
-            "observation_warning": observation_warning,
-            "positions": position_results,
+            "status":
+                "success",
+            "strategy_id":
+                request.strategy_id,
+            "strategy_name":
+                strategy.get(
+                    "strategy_name"
+                ),
+            "positions_updated":
+                len(position_results),
+            "positions_resolved":
+                len(resolution_updates),
+            "realised_pnl":
+                round(realised_pnl, 2),
+            "unrealised_mtm":
+                total_unrealised_mtm,
+            "total_pnl":
+                total_pnl,
+            "current_spot_price":
+                current_spot_price,
+            "underlying_quote_key":
+                spot_quote_key,
+            "margin_used":
+                margin_used,
+            "initial_margin":
+                initial_margin,
+            "margin_status":
+                margin_status,
+            "refreshed_at":
+                refreshed_at,
+            "nearest_dte":
+                observation_result.get(
+                    "nearest_dte"
+                ),
+            "observations_active":
+                observation_result.get(
+                    "observations_active",
+                    0,
+                ),
+            "observation_codes":
+                observation_result.get(
+                    "observation_codes",
+                    [],
+                ),
+            "observation_warning":
+                observation_warning,
+            "positions":
+                position_results,
         }
 
     except HTTPException:
         raise
+
     except Exception as exc:
         raise HTTPException(
             status_code=500,
-            detail=f"Unable to refresh strategy market data: {str(exc)}",
+            detail=(
+                "Unable to refresh strategy "
+                f"market data: {str(exc)}"
+            ),
         ) from exc
-
-
 @app.post("/portfolio/settings")
 def update_portfolio_settings(request: PortfolioSettingsRequest) -> dict[str, Any]:
     database = get_supabase()
