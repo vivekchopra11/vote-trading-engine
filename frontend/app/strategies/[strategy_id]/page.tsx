@@ -49,6 +49,7 @@ type Position = {
   entry_price: number;
   current_price: number | null;
   contract_multiplier: number | null;
+  lot_size: number | null;
   mtm: number | null;
   realised_pnl: number | null;
   status: string;
@@ -61,6 +62,20 @@ type StrategyEvent = {
   underlying_spot: number | null;
   reason: string | null;
   notes: string | null;
+};
+
+type ClosureRecord = {
+  id: number;
+  close_date: string;
+  realised_pnl: number | null;
+};
+
+type MonthlyPnlRow = {
+  monthKey: string;
+  label: string;
+  realised: number;
+  unrealised: number;
+  net: number;
 };
 
 type RefreshStrategyResponse = {
@@ -344,6 +359,10 @@ export default function StrategyDetailsPage() {
   const [positions, setPositions] = useState<Position[]>([]);
   const [observations, setObservations] = useState<StrategyObservation[]>([]);
   const [events, setEvents] = useState<StrategyEvent[]>([]);
+  const [closures, setClosures] = useState<ClosureRecord[]>([]);
+  const [traderNote, setTraderNote] = useState("");
+  const [savingTraderNote, setSavingTraderNote] = useState(false);
+  const [traderNoteMessage, setTraderNoteMessage] = useState("");
 
   const [loading, setLoading] = useState(true);
   const [errorMessage, setErrorMessage] = useState("");
@@ -459,6 +478,7 @@ export default function StrategyDetailsPage() {
             entry_price,
             current_price,
             contract_multiplier,
+            lot_size,
             mtm,
             realised_pnl,
             status
@@ -554,6 +574,22 @@ export default function StrategyDetailsPage() {
     });
   }, [loadStrategyData]);
 
+  useEffect(() => {
+    async function loadClosures() {
+      const { data, error } = await supabase
+        .from("position_closures")
+        .select("id,close_date,realised_pnl")
+        .eq("strategy_id", strategyId)
+        .order("close_date", { ascending: true });
+
+      if (!error) {
+        setClosures((data ?? []) as ClosureRecord[]);
+      }
+    }
+
+    void loadClosures();
+  }, [strategyId]);
+
   const openPositions = useMemo(
     () =>
       positions.filter(
@@ -577,6 +613,32 @@ export default function StrategyDetailsPage() {
     [openPositions],
   );
 
+  const payoffExecutionReserve = useMemo(() => {
+    return openPositions.reduce((total, position) => {
+      if (
+        position.instrument_type !== "OPTION" ||
+        position.position_side !== "SELL"
+      ) {
+        return total;
+      }
+
+      const openQuantity = Number(position.open_quantity ?? 0);
+      const lotSize = Number(position.lot_size ?? 0);
+
+      if (
+        !Number.isFinite(openQuantity) ||
+        openQuantity <= 0 ||
+        !Number.isFinite(lotSize) ||
+        lotSize <= 0
+      ) {
+        return total;
+      }
+
+      const openLots = openQuantity / lotSize;
+      return total + openLots * 2000;
+    }, 0);
+  }, [openPositions]);
+
   const sortedOpenPositions = useMemo(
     () => sortStrategyPositions(openPositions),
     [openPositions],
@@ -595,6 +657,52 @@ export default function StrategyDetailsPage() {
 
     return values.length > 0 ? Math.min(...values) : null;
   }, [openPositions]);
+
+  const monthlyPnlRows = useMemo<MonthlyPnlRow[]>(() => {
+    const grouped = new Map<string, MonthlyPnlRow>();
+
+    closures.forEach((closure) => {
+      const monthKey = String(closure.close_date).slice(0, 7);
+      if (!monthKey) return;
+      const [year, month] = monthKey.split("-").map(Number);
+      const label = new Intl.DateTimeFormat("en-GB", {
+        month: "long",
+        year: "numeric",
+      }).format(new Date(year, month - 1, 1));
+      const current = grouped.get(monthKey) ?? {
+        monthKey,
+        label,
+        realised: 0,
+        unrealised: 0,
+        net: 0,
+      };
+      current.realised += Number(closure.realised_pnl ?? 0);
+      current.net = current.realised + current.unrealised;
+      grouped.set(monthKey, current);
+    });
+
+    if (strategy && strategy.status !== "CLOSED") {
+      const monthKey = new Date().toISOString().slice(0, 7);
+      const [year, month] = monthKey.split("-").map(Number);
+      const current = grouped.get(monthKey) ?? {
+        monthKey,
+        label: new Intl.DateTimeFormat("en-GB", {
+          month: "long",
+          year: "numeric",
+        }).format(new Date(year, month - 1, 1)),
+        realised: 0,
+        unrealised: 0,
+        net: 0,
+      };
+      current.unrealised = Number(strategy.unrealised_mtm ?? 0);
+      current.net = current.realised + current.unrealised;
+      grouped.set(monthKey, current);
+    }
+
+    return Array.from(grouped.values()).sort((a, b) =>
+      b.monthKey.localeCompare(a.monthKey),
+    );
+  }, [closures, strategy]);
 
   const payoffReferenceSpot =
     strategy?.current_spot_price ??
@@ -641,6 +749,47 @@ export default function StrategyDetailsPage() {
       price,
     );
   }, [selectedPosition, closingQuantity, closingPrice]);
+
+  async function saveTraderNote() {
+    if (!strategy || !traderNote.trim() || savingTraderNote) return;
+
+    setSavingTraderNote(true);
+    setTraderNoteMessage("");
+
+    try {
+      const now = new Date().toISOString();
+      const { data, error } = await supabase
+        .from("strategy_events")
+        .insert({
+          strategy_id: strategy.strategy_id,
+          event_type: "TRADER_NOTE",
+          event_date: now,
+          underlying_spot: strategy.current_spot_price,
+          reason: "Trader note",
+          notes: traderNote.trim(),
+        })
+        .select("id,event_type,event_date,underlying_spot,reason,notes")
+        .single();
+
+      if (error || !data) {
+        throw new Error(error?.message ?? "Unable to save trader note.");
+      }
+
+      setEvents((current) =>
+        [...current, data as StrategyEvent].sort(
+          (a, b) => new Date(a.event_date).getTime() - new Date(b.event_date).getTime(),
+        ),
+      );
+      setTraderNote("");
+      setTraderNoteMessage("Note added to the strategy timeline.");
+    } catch (error) {
+      setTraderNoteMessage(
+        error instanceof Error ? error.message : "Unable to save trader note.",
+      );
+    } finally {
+      setSavingTraderNote(false);
+    }
+  }
 
   async function refreshPrices() {
     if (!strategy || strategy.status === "CLOSED") {
@@ -1621,7 +1770,7 @@ export default function StrategyDetailsPage() {
           </div>
         )}
 
-        <section className="mt-6 grid gap-4 sm:grid-cols-2 xl:grid-cols-8">
+        <section className="mt-6 grid gap-4 sm:grid-cols-2 xl:grid-cols-7">
           <SummaryCard
             label="Realised P&L"
             value={formatCurrency(strategy.realised_pnl)}
@@ -1652,7 +1801,7 @@ export default function StrategyDetailsPage() {
           />
 
           <SummaryCard
-            label="Margin Used"
+            label="Capital Deployed"
             value={
               strategy.margin_used !== null && strategy.margin_used !== undefined
                 ? formatCurrency(strategy.margin_used)
@@ -1661,18 +1810,81 @@ export default function StrategyDetailsPage() {
           />
 
           <SummaryCard
-            label="Return on Margin"
-            value={
-              strategy.margin_used && strategy.margin_used > 0
-                ? `${((Number(strategy.total_pnl ?? 0) / strategy.margin_used) * 100).toLocaleString("en-IN", { maximumFractionDigits: 2 })}%`
-                : "—"
-            }
-          />
-
-          <SummaryCard
             label="Open Legs"
             value={String(openPositions.length)}
           />
+        </section>
+
+        <section className="mt-6 grid gap-6 lg:grid-cols-[1.2fr_1fr]">
+          <div className="rounded-lg border border-gray-300 bg-white p-6">
+            <p className="text-xs font-semibold uppercase tracking-[0.16em] text-gray-500">
+              Strategy P&amp;L by month
+            </p>
+            <h2 className="mt-1 text-xl font-semibold">Realised vs Unrealised</h2>
+            <div className="mt-4 overflow-x-auto">
+              <table className="w-full min-w-[540px] text-left text-sm">
+                <thead className="bg-gray-50 text-xs uppercase tracking-wide text-gray-500">
+                  <tr>
+                    <th className="px-3 py-2">Month</th>
+                    <th className="px-3 py-2 text-right">Realised P&amp;L</th>
+                    <th className="px-3 py-2 text-right">Unrealised MTM</th>
+                    <th className="px-3 py-2 text-right">Net P&amp;L</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {monthlyPnlRows.length === 0 ? (
+                    <tr>
+                      <td colSpan={4} className="px-3 py-4 text-gray-500">
+                        No monthly P&amp;L activity yet.
+                      </td>
+                    </tr>
+                  ) : (
+                    monthlyPnlRows.map((row) => (
+                      <tr key={row.monthKey} className="border-t border-gray-200">
+                        <td className="px-3 py-3 font-semibold">{row.label}</td>
+                        <td className="px-3 py-3 text-right">{formatCurrency(row.realised)}</td>
+                        <td className="px-3 py-3 text-right">{formatCurrency(row.unrealised)}</td>
+                        <td className="px-3 py-3 text-right font-semibold">{formatCurrency(row.net)}</td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div className="rounded-lg border border-gray-300 bg-white p-6">
+            <p className="text-xs font-semibold uppercase tracking-[0.16em] text-gray-500">
+              Trade lifecycle journal
+            </p>
+            <h2 className="mt-1 text-xl font-semibold">Add trader note</h2>
+            <p className="mt-2 text-sm text-gray-500">
+              Record your thinking even when no position change is made. The note becomes a timestamped timeline event.
+            </p>
+            <textarea
+              value={traderNote}
+              onChange={(event) => setTraderNote(event.target.value)}
+              rows={5}
+              placeholder="What are you observing? Why are you holding, waiting or watching?"
+              className="mt-4 w-full rounded border border-gray-300 px-3 py-3"
+            />
+            <div className="mt-3 flex items-center justify-between gap-3">
+              <p className="text-xs text-gray-500">
+                Spot snapshot: {strategy.current_spot_price ? `₹${formatNumber(strategy.current_spot_price)}` : "—"}
+              </p>
+              <button
+                type="button"
+                onClick={saveTraderNote}
+                disabled={!traderNote.trim() || savingTraderNote}
+                className="rounded bg-gray-950 px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                {savingTraderNote ? "Saving..." : "Add Note"}
+              </button>
+            </div>
+            {traderNoteMessage && (
+              <p className="mt-3 text-sm text-gray-600">{traderNoteMessage}</p>
+            )}
+          </div>
         </section>
 
         <ObservationPanel observations={observations} />
@@ -1806,6 +2018,7 @@ export default function StrategyDetailsPage() {
               legs={payoffLegs}
               currentSpot={payoffReferenceSpot}
               expiryMonth={strategy.expiry_month}
+              executionReserve={payoffExecutionReserve}
               chartHeight={650}
               pnlOffset={
                 payoffMode === "LIFECYCLE"

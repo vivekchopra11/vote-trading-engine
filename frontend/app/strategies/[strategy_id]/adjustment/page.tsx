@@ -405,10 +405,18 @@ instrumentType: "OPTION" as const,
     });
   }, [legs]);
 
-  const previewStrategyLegs = useMemo<StrategyLeg[]>(
-    () => [...currentStrategyLegs, ...confirmedDraftLegs],
-    [currentStrategyLegs, confirmedDraftLegs],
-  );
+  const previewStrategyLegs = useMemo<StrategyLeg[]>(() => {
+    const activeDraftLegs = draftConfirmed
+      ? confirmedDraftLegs
+      : draftStrategyLegs;
+
+    return [...currentStrategyLegs, ...activeDraftLegs];
+  }, [
+    currentStrategyLegs,
+    draftConfirmed,
+    confirmedDraftLegs,
+    draftStrategyLegs,
+  ]);
 
   const chartSpot = useMemo(() => {
     const enteredSpot = Number(underlyingSpot);
@@ -438,15 +446,15 @@ instrumentType: "OPTION" as const,
 
   const previewPayoffPoints = useMemo(
     () =>
-      draftConfirmed
+      previewStrategyLegs.length > 0
         ? calculateStrategyPayoff(
             previewStrategyLegs,
             chartSpot,
             20,
             401,
-   )
+          )
         : [],
-    [draftConfirmed, previewStrategyLegs, chartSpot],
+    [previewStrategyLegs, chartSpot],
   );
 
   const currentMetrics = useMemo<StrategyMetrics>(
@@ -456,10 +464,10 @@ instrumentType: "OPTION" as const,
 
   const previewMetrics = useMemo<StrategyMetrics | null>(
     () =>
-      draftConfirmed
+      previewPayoffPoints.length > 0
         ? calculatePayoffMetrics(previewPayoffPoints, chartSpot)
         : null,
-    [draftConfirmed, previewPayoffPoints, chartSpot],
+    [previewPayoffPoints, chartSpot],
   );
 
   const currentNetCredit = useMemo(
@@ -469,10 +477,10 @@ instrumentType: "OPTION" as const,
 
   const previewNetCredit = useMemo(
     () =>
-      draftConfirmed
+      previewStrategyLegs.length > 0
         ? calculateNetCredit(previewStrategyLegs)
         : null,
-    [draftConfirmed, previewStrategyLegs],
+    [previewStrategyLegs],
   );
 
   const comparisonRows = useMemo<ComparisonRow[]>(() => {
@@ -807,7 +815,7 @@ instrumentType: "OPTION" as const,
     setSaving(true);
 
     try {
-      constspot = Number(underlyingSpot);
+      const spot = Number(underlyingSpot);
 
       const { data: eventData, error: eventError } =
         await supabase
@@ -1257,7 +1265,9 @@ instrumentType: "OPTION" as const,
             <PayoffPanel
               legs={currentStrategyLegs}
               comparisonLegs={
-                draftConfirmed ? previewStrategyLegs : undefined
+                draftStrategyLegs.length > 0
+                  ? previewStrategyLegs
+                  : undefined
               }
               currentSpot={chartSpot}
               expiryMonth={strategy.expiry_month}
@@ -1269,7 +1279,7 @@ instrumentType: "OPTION" as const,
 
           {!draftConfirmed && (
             <div className="mt-4 rounded-lg border border-dashed border-blue-300 bg-blue-50 px-5 py-4 text-sm text-blue-800">
-              Complete the draft above to display the blue preview curve on the same chart.
+              The preview curve updates automatically while you build the adjustment. Complete Draft only locks the proposal before commit.
             </div>
           )}
         </section>
@@ -1317,21 +1327,21 @@ instrumentType: "OPTION" as const,
           </td>
 
                       <td className="p-3 text-right font-semibold">
-                        {draftConfirmed
-                          ?formatter(row.preview)
+                        {previewMetrics
+                          ? formatter(row.preview)
                           : "—"}
                       </td>
 
                       <td className={`p-3 text-right font-semibold ${toneClass}`}>
-                        {draftConfirmed
+                        {previewMetrics
                           ? formatter(row.difference)
                           : "—"}
            </td>
 
                       <td className={`p-3 font-semibold ${toneClass}`}>
-                        {draftConfirmed
- ? row.impact
-                          : "Waiting for preview"}
+                        {previewMetrics
+                          ? row.impact
+                          : "Waiting for valid draft leg"}
                       </td>
                     </tr>
                   );
