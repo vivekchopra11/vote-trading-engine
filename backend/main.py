@@ -1,4 +1,5 @@
 import os
+import math
 from datetime import date, datetime, time, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -24,6 +25,8 @@ kite_api_key = os.getenv("KITE_API_KEY")
 kite_api_secret = os.getenv("KITE_API_SECRET")
 supabase_url = os.getenv("SUPABASE_URL")
 supabase_service_role_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+RISK_FREE_RATE = float(os.getenv("GREEKS_RISK_FREE_RATE", "0.06"))
+DIVIDEND_YIELD = float(os.getenv("GREEKS_DIVIDEND_YIELD", "0.0"))
 
 app.add_middleware(
     CORSMiddleware,
@@ -248,6 +251,163 @@ def calculate_position_mtm(
     else:
         raise ValueError(f"Unsupported position side: {side}")
     return round(mtm, 2)
+
+
+def _normal_cdf(value: float) -> float:
+    return 0.5 * (1.0 + math.erf(value / math.sqrt(2.0)))
+
+
+def _normal_pdf(value: float) -> float:
+    return math.exp(-0.5 * value * value) / math.sqrt(2.0 * math.pi)
+
+
+def _option_time_to_expiry(expiry_value: Any) -> float | None:
+    expiry = parse_date_value(expiry_value)
+    if not expiry:
+        return None
+    expiry_dt = datetime.combine(expiry, time(hour=15, minute=30), tzinfo=IST)
+    seconds = (expiry_dt - datetime.now(IST)).total_seconds()
+    if seconds <= 0:
+        return None
+    return seconds / (365.0 * 24.0 * 60.0 * 60.0)
+
+
+def _black_scholes_price(
+    *,
+    spot: float,
+    strike: float,
+    time_years: float,
+    volatility: float,
+    option_type: str,
+    risk_free_rate: float = RISK_FREE_RATE,
+    dividend_yield: float = DIVIDEND_YIELD,
+) -> float:
+    if spot <= 0 or strike <= 0 or time_years <= 0 or volatility <= 0:
+        return 0.0
+    sqrt_t = math.sqrt(time_years)
+    d1 = (
+        math.log(spot / strike)
+        + (risk_free_rate - dividend_yield + 0.5 * volatility * volatility) * time_years
+    ) / (volatility * sqrt_t)
+    d2 = d1 - volatility * sqrt_t
+    discounted_spot = spot * math.exp(-dividend_yield * time_years)
+    discounted_strike = strike * math.exp(-risk_free_rate * time_years)
+    if option_type == "CE":
+        return discounted_spot * _normal_cdf(d1) - discounted_strike * _normal_cdf(d2)
+    return discounted_strike * _normal_cdf(-d2) - discounted_spot * _normal_cdf(-d1)
+
+
+def solve_implied_volatility(
+    *,
+    market_price: float,
+    spot: float,
+    strike: float,
+    time_years: float,
+    option_type: str,
+) -> float | None:
+    if market_price <= 0 or spot <= 0 or strike <= 0 or time_years <= 0:
+        return None
+    discounted_spot = spot * math.exp(-DIVIDEND_YIELD * time_years)
+    discounted_strike = strike * math.exp(-RISK_FREE_RATE * time_years)
+    intrinsic_floor = (
+        max(0.0, discounted_spot - discounted_strike)
+        if option_type == "CE"
+        else max(0.0, discounted_strike - discounted_spot)
+    )
+    if market_price + 1e-8 < intrinsic_floor:
+        return None
+    low, high = 0.0001, 5.0
+    high_price = _black_scholes_price(
+        spot=spot, strike=strike, time_years=time_years, volatility=high, option_type=option_type
+    )
+    if market_price > high_price + 1e-6:
+        return None
+    for _ in range(80):
+        mid = (low + high) / 2.0
+        model_price = _black_scholes_price(
+            spot=spot, strike=strike, time_years=time_years, volatility=mid, option_type=option_type
+        )
+        if abs(model_price - market_price) < 1e-7:
+            return mid
+        if model_price < market_price:
+            low = mid
+        else:
+            high = mid
+    return (low + high) / 2.0
+
+
+def calculate_position_greeks(
+    *,
+    position: dict[str, Any],
+    current_price: float,
+    spot: float,
+) -> dict[str, float | None]:
+    instrument_type = str(position.get("instrument_type") or "").strip().upper()
+    side = str(position.get("position_side") or "").strip().upper()
+    sign = 1.0 if side == "BUY" else -1.0
+    quantity = float(position.get("open_quantity") or 0)
+    multiplier = float(position.get("contract_multiplier") or 1)
+    exposure = quantity * multiplier
+
+    if instrument_type in {"FUTURE", "EQUITY"}:
+        return {
+            "implied_volatility": None,
+            "delta": round(sign * exposure, 4),
+            "gamma": 0.0,
+            "theta": 0.0,
+            "vega": 0.0,
+        }
+
+    if instrument_type != "OPTION":
+        return {"implied_volatility": None, "delta": None, "gamma": None, "theta": None, "vega": None}
+
+    strike = float(position.get("strike") or 0)
+    option_type = str(position.get("option_type") or "").strip().upper()
+    time_years = _option_time_to_expiry(position.get("expiry_date"))
+    if strike <= 0 or option_type not in {"CE", "PE"} or time_years is None:
+        return {"implied_volatility": None, "delta": None, "gamma": None, "theta": None, "vega": None}
+
+    iv = solve_implied_volatility(
+        market_price=current_price, spot=spot, strike=strike, time_years=time_years, option_type=option_type
+    )
+    if iv is None:
+        return {"implied_volatility": None, "delta": None, "gamma": None, "theta": None, "vega": None}
+
+    sqrt_t = math.sqrt(time_years)
+    d1 = (
+        math.log(spot / strike)
+        + (RISK_FREE_RATE - DIVIDEND_YIELD + 0.5 * iv * iv) * time_years
+    ) / (iv * sqrt_t)
+    d2 = d1 - iv * sqrt_t
+    exp_q = math.exp(-DIVIDEND_YIELD * time_years)
+    exp_r = math.exp(-RISK_FREE_RATE * time_years)
+    pdf_d1 = _normal_pdf(d1)
+
+    if option_type == "CE":
+        delta_unit = exp_q * _normal_cdf(d1)
+        theta_annual_unit = (
+            -(spot * exp_q * pdf_d1 * iv) / (2.0 * sqrt_t)
+            - RISK_FREE_RATE * strike * exp_r * _normal_cdf(d2)
+            + DIVIDEND_YIELD * spot * exp_q * _normal_cdf(d1)
+        )
+    else:
+        delta_unit = exp_q * (_normal_cdf(d1) - 1.0)
+        theta_annual_unit = (
+            -(spot * exp_q * pdf_d1 * iv) / (2.0 * sqrt_t)
+            + RISK_FREE_RATE * strike * exp_r * _normal_cdf(-d2)
+            - DIVIDEND_YIELD * spot * exp_q * _normal_cdf(-d1)
+        )
+
+    gamma_unit = exp_q * pdf_d1 / (spot * iv * sqrt_t)
+    vega_unit_per_vol_point = spot * exp_q * pdf_d1 * sqrt_t / 100.0
+
+    return {
+        "implied_volatility": round(iv * 100.0, 4),
+        "delta": round(sign * delta_unit * exposure, 4),
+        "gamma": round(sign * gamma_unit * exposure, 6),
+        "theta": round(sign * (theta_annual_unit / 365.0) * exposure, 2),
+        "vega": round(sign * vega_unit_per_vol_point * exposure, 2),
+    }
 
 
 
@@ -850,14 +1010,24 @@ def refresh_strategy(request: RefreshStrategyRequest) -> dict[str, Any]:
                 contract_multiplier=contract_multiplier,
             )
 
-            # Keep the current data model intact. This is still one write per leg;
-            # we can optimize writes later if this remains the bottleneck.
-            (
-                database.table("book_positions")
-                .update({"current_price": current_price, "mtm": mtm})
-                .eq("id", position["id"])
-                .execute()
+            greeks = calculate_position_greeks(
+                position=position,
+                current_price=current_price,
+                spot=current_spot_price,
             )
+
+            greeks_updated_at = datetime.now(IST).isoformat()
+            update_payload = {
+                "current_price": current_price,
+                "mtm": mtm,
+                "implied_volatility": greeks["implied_volatility"],
+                "delta": greeks["delta"],
+                "gamma": greeks["gamma"],
+                "theta": greeks["theta"],
+                "vega": greeks["vega"],
+                "greeks_updated_at": greeks_updated_at,
+            }
+            database.table("book_positions").update(update_payload).eq("id", position["id"]).execute()
 
             total_unrealised_mtm += mtm
             position_results.append(
@@ -872,6 +1042,7 @@ def refresh_strategy(request: RefreshStrategyRequest) -> dict[str, Any]:
                     "contract_multiplier": contract_multiplier,
                     "lot_size": position.get("lot_size"),
                     "mtm": mtm,
+                    **greeks,
                 }
             )
 
@@ -879,6 +1050,22 @@ def refresh_strategy(request: RefreshStrategyRequest) -> dict[str, Any]:
         realised_pnl = float(strategy.get("realised_pnl") or 0)
         total_pnl = round(realised_pnl + total_unrealised_mtm, 2)
         refreshed_at = datetime.now(IST).isoformat()
+
+        strategy_delta = round(sum(float(item.get("delta") or 0) for item in position_results), 4)
+        strategy_gamma = round(sum(float(item.get("gamma") or 0) for item in position_results), 6)
+        strategy_theta = round(sum(float(item.get("theta") or 0) for item in position_results), 2)
+        strategy_vega = round(sum(float(item.get("vega") or 0) for item in position_results), 2)
+        iv_rows = [
+            (float(item["implied_volatility"]), float(item.get("open_quantity") or 0))
+            for item in position_results
+            if item.get("implied_volatility") is not None and float(item.get("open_quantity") or 0) > 0
+        ]
+        iv_weight = sum(weight for _, weight in iv_rows)
+        weighted_iv = (
+            round(sum(iv * weight for iv, weight in iv_rows) / iv_weight, 4)
+            if iv_weight > 0
+            else None
+        )
 
         # Price refresh deliberately does NOT recalculate Zerodha basket margin.
         # Existing margin_used/margin_status remain stored in strategy_master.
@@ -890,6 +1077,12 @@ def refresh_strategy(request: RefreshStrategyRequest) -> dict[str, Any]:
                     "total_pnl": total_pnl,
                     "current_spot_price": current_spot_price,
                     "market_data_updated_at": refreshed_at,
+                    "strategy_delta": strategy_delta,
+                    "strategy_gamma": strategy_gamma,
+                    "strategy_theta": strategy_theta,
+                    "strategy_vega": strategy_vega,
+                    "weighted_iv": weighted_iv,
+                    "greeks_updated_at": refreshed_at,
                 }
             )
             .eq("strategy_id", request.strategy_id)
@@ -912,6 +1105,12 @@ def refresh_strategy(request: RefreshStrategyRequest) -> dict[str, Any]:
             "underlying_quote_key": spot_quote_key,
             "margin_used": strategy.get("margin_used"),
             "margin_status": strategy.get("margin_status"),
+            "strategy_delta": strategy_delta,
+            "strategy_gamma": strategy_gamma,
+            "strategy_theta": strategy_theta,
+            "strategy_vega": strategy_vega,
+            "weighted_iv": weighted_iv,
+            "greeks_updated_at": refreshed_at,
             "refreshed_at": refreshed_at,
             "positions": position_results,
         }
