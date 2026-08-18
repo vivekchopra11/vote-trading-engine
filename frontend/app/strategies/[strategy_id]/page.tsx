@@ -6,7 +6,12 @@ import { useParams } from "next/navigation";
 import { supabase } from "@/lib/supabase";
 import PayoffPanel from "@/components/strategy/PayoffPanel";
 import ObservationPanel, { type StrategyObservation } from "@/components/strategy/ObservationPanel";
-import { mapPositionsToStrategyLegs, type StrategyLeg } from "@/lib/payoff";
+import {
+  calculatePayoffMetrics,
+  calculateStrategyPayoff,
+  mapPositionsToStrategyLegs,
+  type StrategyLeg,
+} from "@/lib/payoff";
 
 type Strategy = {
   strategy_id: string;
@@ -31,6 +36,18 @@ type Strategy = {
   realised_pnl: number | null;
   unrealised_mtm: number | null;
   total_pnl: number | null;
+  strategy_delta: number | null;
+  strategy_gamma: number | null;
+  strategy_theta: number | null;
+  strategy_vega: number | null;
+  weighted_iv: number | null;
+  futures_lot_size: number | null;
+  delta_lot_equivalent: number | null;
+  delta_up_1pct_lots: number | null;
+  delta_down_1pct_lots: number | null;
+  pnl_up_1pct: number | null;
+  pnl_down_1pct: number | null;
+  greeks_updated_at: string | null;
   pre_trade_checklist: Record<string, boolean> | null;
 };
 
@@ -51,6 +68,12 @@ type Position = {
   contract_multiplier: number | null;
   lot_size: number | null;
   mtm: number | null;
+  implied_volatility: number | null;
+  delta: number | null;
+  gamma: number | null;
+  theta: number | null;
+  vega: number | null;
+  greeks_updated_at: string | null;
   realised_pnl: number | null;
   status: string;
 };
@@ -269,6 +292,8 @@ type PayoffMode = "CURRENT" | "LIFECYCLE";
 const ZERODHA_LOGIN_URL =
   "https://vote-trading-engine-1.onrender.com/auth/zerodha/login";
 
+const PROFIT_BOOKING_THRESHOLD = 70;
+
 function isZerodhaAuthError(message: string) {
   const normalized = message.toLowerCase();
 
@@ -327,6 +352,28 @@ function positionSortRank(position: Position) {
   if (position.instrument_type === "OPTION" && position.option_type === "PE") return 2;
   if (position.instrument_type === "EQUITY") return 3;
   return 4;
+}
+
+function deltaBiasLabel(deltaLots: number | null | undefined) {
+  if (deltaLots === null || deltaLots === undefined || !Number.isFinite(Number(deltaLots))) {
+    return "Unavailable";
+  }
+
+  const value = Number(deltaLots);
+  const magnitude = Math.abs(value);
+  if (magnitude < 0.25) return "Near neutral";
+  if (magnitude < 0.75) return value > 0 ? "Mild bullish" : "Mild bearish";
+  if (magnitude < 1.5) return value > 0 ? "Bullish" : "Bearish";
+  return value > 0 ? "Strong bullish" : "Strong bearish";
+}
+
+function formatLots(value: number | null | undefined, digits = 2) {
+  if (value === null || value === undefined || !Number.isFinite(Number(value))) return "—";
+  const numeric = Number(value);
+  return `${numeric > 0 ? "+" : ""}${numeric.toLocaleString("en-IN", {
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits,
+  })} lots`;
 }
 
 function sortStrategyPositions(items: Position[]) {
@@ -454,6 +501,18 @@ export default function StrategyDetailsPage() {
             realised_pnl,
             unrealised_mtm,
             total_pnl,
+            strategy_delta,
+            strategy_gamma,
+            strategy_theta,
+            strategy_vega,
+            weighted_iv,
+            futures_lot_size,
+            delta_lot_equivalent,
+            delta_up_1pct_lots,
+            delta_down_1pct_lots,
+            pnl_up_1pct,
+            pnl_down_1pct,
+            greeks_updated_at,
             pre_trade_checklist
             `,
           )
@@ -480,6 +539,12 @@ export default function StrategyDetailsPage() {
             contract_multiplier,
             lot_size,
             mtm,
+            implied_volatility,
+            delta,
+            gamma,
+            theta,
+            vega,
+            greeks_updated_at,
             realised_pnl,
             status
             `,
@@ -639,6 +704,128 @@ export default function StrategyDetailsPage() {
     }, 0);
   }, [openPositions]);
 
+  const payoffReferenceSpot =
+    strategy?.current_spot_price ??
+    strategy?.entry_spot_price ??
+    null;
+
+  const currentPayoffPoints = useMemo(
+    () => calculateStrategyPayoff(payoffLegs, payoffReferenceSpot, 20, 401),
+    [payoffLegs, payoffReferenceSpot],
+  );
+
+  const currentPayoffMetrics = useMemo(
+    () => calculatePayoffMetrics(currentPayoffPoints, payoffReferenceSpot),
+    [currentPayoffPoints, payoffReferenceSpot],
+  );
+
+  const realisticMaxProfit = useMemo(() => {
+    const theoretical = currentPayoffMetrics.maxProfit;
+    if (theoretical === null || !Number.isFinite(theoretical) || theoretical <= 0) {
+      return null;
+    }
+    return Math.max(0, theoretical - payoffExecutionReserve);
+  }, [currentPayoffMetrics.maxProfit, payoffExecutionReserve]);
+
+  const currentProfitCapturePct = useMemo(() => {
+    if (realisticMaxProfit === null || realisticMaxProfit <= 0) return null;
+    const mtm = Number(strategy?.unrealised_mtm ?? 0);
+    if (!Number.isFinite(mtm) || mtm <= 0) return 0;
+    return (mtm / realisticMaxProfit) * 100;
+  }, [realisticMaxProfit, strategy?.unrealised_mtm]);
+
+  const profitBookingZone =
+    currentProfitCapturePct !== null &&
+    currentProfitCapturePct >= PROFIT_BOOKING_THRESHOLD;
+
+  const thetaEfficiencyPerLakh = useMemo(() => {
+    const theta = Number(strategy?.strategy_theta);
+    const margin = Number(strategy?.margin_used);
+    if (!Number.isFinite(theta) || !Number.isFinite(margin) || margin <= 0) return null;
+    return (theta / margin) * 100000;
+  }, [strategy?.strategy_theta, strategy?.margin_used]);
+
+  const vegaFivePointShock = useMemo(() => {
+    const vega = Number(strategy?.strategy_vega);
+    if (!Number.isFinite(vega)) return null;
+    return vega * 5;
+  }, [strategy?.strategy_vega]);
+
+  async function captureDailyStrategySnapshot() {
+    if (!strategy) return;
+
+    const { data: freshStrategy, error: strategySnapshotError } = await supabase
+      .from("strategy_master")
+      .select("strategy_id,current_spot_price,realised_pnl,unrealised_mtm,total_pnl,margin_used,strategy_delta,strategy_gamma,strategy_theta,strategy_vega,weighted_iv")
+      .eq("strategy_id", strategy.strategy_id)
+      .single();
+
+    if (strategySnapshotError || !freshStrategy) {
+      throw new Error(strategySnapshotError?.message ?? "Unable to read strategy for daily snapshot.");
+    }
+
+    const { data: freshPositions, error: positionsSnapshotError } = await supabase
+      .from("book_positions")
+      .select("id,strategy_event_id,instrument_type,option_type,strike,expiry_date,position_side,quantity,open_quantity,closed_quantity,entry_date,entry_price,current_price,contract_multiplier,lot_size,mtm,implied_volatility,delta,gamma,theta,vega,greeks_updated_at,realised_pnl,status")
+      .eq("strategy_id", strategy.strategy_id)
+      .gt("open_quantity", 0);
+
+    if (positionsSnapshotError) throw new Error(positionsSnapshotError.message);
+
+    const snapshotPositions = (freshPositions ?? []) as Position[];
+    const snapshotLegs = mapPositionsToStrategyLegs(snapshotPositions);
+    const snapshotReserve = snapshotPositions.reduce((total, position) => {
+      if (position.instrument_type !== "OPTION" || position.position_side !== "SELL") return total;
+      const openQuantity = Number(position.open_quantity ?? 0);
+      const lotSize = Number(position.lot_size ?? 0);
+      if (openQuantity <= 0 || lotSize <= 0) return total;
+      return total + (openQuantity / lotSize) * 2000;
+    }, 0);
+
+    const snapshotSpot = Number(freshStrategy.current_spot_price) > 0
+      ? Number(freshStrategy.current_spot_price)
+      : strategy.entry_spot_price;
+    const points = calculateStrategyPayoff(snapshotLegs, snapshotSpot, 20, 401);
+    const metrics = calculatePayoffMetrics(points, snapshotSpot);
+    const theoretical = metrics.maxProfit;
+    const snapshotRealisticMax =
+      theoretical !== null && Number.isFinite(theoretical) && theoretical > 0
+        ? Math.max(0, theoretical - snapshotReserve)
+        : null;
+    const snapshotUnrealised = Number(freshStrategy.unrealised_mtm ?? 0);
+    const snapshotCapture =
+      snapshotRealisticMax !== null && snapshotRealisticMax > 0
+        ? Math.max(0, (snapshotUnrealised / snapshotRealisticMax) * 100)
+        : null;
+    const dtes = snapshotPositions
+      .filter((p) => p.instrument_type !== "EQUITY")
+      .map((p) => calculateDte(p.expiry_date))
+      .filter((v): v is number => v !== null);
+
+    const { error: snapshotError } = await supabase
+      .from("strategy_daily_snapshots")
+      .upsert({
+        strategy_id: strategy.strategy_id,
+        snapshot_date: new Date().toISOString().slice(0, 10),
+        captured_at: new Date().toISOString(),
+        current_spot_price: freshStrategy.current_spot_price,
+        unrealised_mtm: snapshotUnrealised,
+        realised_pnl: Number(freshStrategy.realised_pnl ?? 0),
+        total_pnl: Number(freshStrategy.total_pnl ?? 0),
+        realistic_max_profit: snapshotRealisticMax,
+        unrealised_capture_pct: snapshotCapture,
+        margin_used: freshStrategy.margin_used,
+        nearest_dte: dtes.length > 0 ? Math.min(...dtes) : null,
+        strategy_delta: freshStrategy.strategy_delta,
+        strategy_gamma: freshStrategy.strategy_gamma,
+        strategy_theta: freshStrategy.strategy_theta,
+        strategy_vega: freshStrategy.strategy_vega,
+        weighted_iv: freshStrategy.weighted_iv,
+      }, { onConflict: "strategy_id,snapshot_date" });
+
+    if (snapshotError) throw new Error(snapshotError.message);
+  }
+
   const sortedOpenPositions = useMemo(
     () => sortStrategyPositions(openPositions),
     [openPositions],
@@ -703,11 +890,6 @@ export default function StrategyDetailsPage() {
       b.monthKey.localeCompare(a.monthKey),
     );
   }, [closures, strategy]);
-
-  const payoffReferenceSpot =
-    strategy?.current_spot_price ??
-    strategy?.entry_spot_price ??
-    null;
 
   const enteredClosingQuantity = Number(closingQuantity);
 
@@ -846,6 +1028,12 @@ export default function StrategyDetailsPage() {
       // immediately so the UI, payoff panel and MTM cards all update
       // without requiring a browser refresh.
       await loadStrategyData(false);
+
+      try {
+        await captureDailyStrategySnapshot();
+      } catch (snapshotError) {
+        console.warn("Daily strategy snapshot could not be saved:", snapshotError);
+      }
 
       setLastRefreshedAt(result.refreshed_at ?? null);
       setRefreshMessage(
@@ -1053,6 +1241,18 @@ export default function StrategyDetailsPage() {
             realised_pnl,
             unrealised_mtm,
             total_pnl,
+            strategy_delta,
+            strategy_gamma,
+            strategy_theta,
+            strategy_vega,
+            weighted_iv,
+            futures_lot_size,
+            delta_lot_equivalent,
+            delta_up_1pct_lots,
+            delta_down_1pct_lots,
+            pnl_up_1pct,
+            pnl_down_1pct,
+            greeks_updated_at,
             pre_trade_checklist
             `,
           )
@@ -1101,9 +1301,9 @@ export default function StrategyDetailsPage() {
       if (editEvent) {
         setEvents((current) =>
           [...current, editEvent].sort(
-            (first, second) =>
-              new Date(first.event_date).getTime() -
-              new Date(second.event_date).getTime(),
+           (first, second) =>
+  new Date(second.event_date).getTime() -
+  new Date(first.event_date).getTime()
           ),
         );
       }
@@ -1569,8 +1769,8 @@ export default function StrategyDetailsPage() {
       setEvents((currentEvents) =>
         [...currentEvents, closureEvent].sort(
           (first, second) =>
-            new Date(first.event_date).getTime() -
-            new Date(second.event_date).getTime(),
+  new Date(second.event_date).getTime() -
+  new Date(first.event_date).getTime()
         ),
       );
 
@@ -1770,7 +1970,7 @@ export default function StrategyDetailsPage() {
           </div>
         )}
 
-        <section className="mt-6 grid gap-4 sm:grid-cols-2 xl:grid-cols-7">
+        <section className="mt-6 grid gap-4 sm:grid-cols-2 xl:grid-cols-8">
           <SummaryCard
             label="Realised P&L"
             value={formatCurrency(strategy.realised_pnl)}
@@ -1779,6 +1979,13 @@ export default function StrategyDetailsPage() {
           <SummaryCard
             label="Unrealised MTM"
             value={formatCurrency(strategy.unrealised_mtm)}
+          />
+
+          <ProfitCaptureCard
+            capturePct={currentProfitCapturePct}
+            unrealisedMtm={strategy.unrealised_mtm}
+            realisticMaxProfit={realisticMaxProfit}
+            bookingZone={profitBookingZone}
           />
 
           <SummaryCard
@@ -1813,6 +2020,144 @@ export default function StrategyDetailsPage() {
             label="Open Legs"
             value={String(openPositions.length)}
           />
+        </section>
+
+        <section className="mt-6 rounded-lg border border-gray-300 bg-white p-6">
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
+            <div>
+              <p className="text-xs font-semibold uppercase tracking-[0.16em] text-gray-500">
+                Strategy risk / reward
+              </p>
+              <h2 className="mt-1 text-xl font-semibold">What the Greeks mean now</h2>
+              <p className="mt-2 max-w-3xl text-sm text-gray-500">
+                Raw Greeks remain available in the position ladder. This view translates them into futures-lot exposure and rupee risk.
+              </p>
+            </div>
+            <p className="text-xs text-gray-500">
+              {strategy.greeks_updated_at
+                ? `Updated ${new Date(strategy.greeks_updated_at).toLocaleString("en-IN")}`
+                : "Refresh Market Data to calculate risk."}
+            </p>
+          </div>
+
+          <div className="mt-6 grid gap-4 xl:grid-cols-4">
+            <RiskCard
+              eyebrow="Reward for waiting"
+              title="Theta"
+              primary={strategy.strategy_theta === null ? "—" : `${formatCurrency(strategy.strategy_theta)} / day`}
+              secondary={
+                thetaEfficiencyPerLakh === null
+                  ? "Theta efficiency unavailable"
+                  : `${formatCurrency(thetaEfficiencyPerLakh)} / ₹1L margin / day`
+              }
+              note="Model estimate for one calendar day with spot and IV broadly unchanged."
+            />
+
+            <RiskCard
+              eyebrow="Directional exposure"
+              title="Delta"
+              primary={formatLots(strategy.delta_lot_equivalent)}
+              secondary={deltaBiasLabel(strategy.delta_lot_equivalent)}
+              note={
+                strategy.strategy_delta === null || strategy.futures_lot_size === null
+                  ? "Refresh market data to calculate futures-lot equivalent."
+                  : `${formatNumber(strategy.strategy_delta)} share-equivalent delta · 1 futures lot = ${formatNumber(strategy.futures_lot_size)} shares`
+              }
+            />
+
+            <RiskCard
+              eyebrow="Volatility exposure"
+              title="Vega"
+              primary={strategy.strategy_vega === null ? "—" : `${formatCurrency(strategy.strategy_vega)} / IV pt`}
+              secondary={
+                vegaFivePointShock === null
+                  ? "5-point IV shock unavailable"
+                  : `+5 IV pts ≈ ${formatCurrency(vegaFivePointShock)}`
+              }
+              note={
+                strategy.weighted_iv === null
+                  ? "Weighted IV unavailable"
+                  : `Current weighted IV ${formatNumber(strategy.weighted_iv)}%`
+              }
+            />
+
+            <RiskCard
+              eyebrow="Remaining opportunity"
+              title="Profit capture"
+              primary={currentProfitCapturePct === null ? "—" : `${currentProfitCapturePct.toFixed(1)}%`}
+              secondary={
+                realisticMaxProfit === null
+                  ? "Realistic max profit unavailable"
+                  : `${formatCurrency(strategy.unrealised_mtm)} of ${formatCurrency(realisticMaxProfit)}`
+              }
+              note={profitBookingZone ? "Profit booking zone reached." : "Compare remaining opportunity with the risk of waiting."}
+            />
+          </div>
+
+          <div className="mt-6 rounded-lg border border-gray-300 bg-gray-50 p-5">
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
+              <div>
+                <p className="text-xs font-semibold uppercase tracking-[0.14em] text-gray-500">
+                  Gamma translated into a ±1% stock move
+                </p>
+                <h3 className="mt-1 text-lg font-semibold">How directional exposure can change</h3>
+              </div>
+              <p className="text-xs text-gray-500">
+                Repriced at current IV and DTE; no additional Zerodha quote call.
+              </p>
+            </div>
+
+            <div className="mt-4 overflow-x-auto">
+              <table className="w-full min-w-[720px] text-left text-sm">
+                <thead className="text-xs uppercase tracking-wide text-gray-500">
+                  <tr>
+                    <th className="px-3 py-2">Scenario</th>
+                    <th className="px-3 py-2 text-right">Spot</th>
+                    <th className="px-3 py-2 text-right">Delta equivalent</th>
+                    <th className="px-3 py-2 text-right">Change vs now</th>
+                    <th className="px-3 py-2 text-right">Approx. strategy P&amp;L impact</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr className="border-t border-gray-200 bg-white">
+                    <td className="px-3 py-3 font-semibold">Stock +1%</td>
+                    <td className="px-3 py-3 text-right">
+                      {strategy.current_spot_price === null ? "—" : `₹${formatNumber(strategy.current_spot_price * 1.01)}`}
+                    </td>
+                    <td className="px-3 py-3 text-right font-semibold">{formatLots(strategy.delta_up_1pct_lots)}</td>
+                    <td className="px-3 py-3 text-right">
+                      {strategy.delta_up_1pct_lots === null || strategy.delta_lot_equivalent === null
+                        ? "—"
+                        : formatLots(strategy.delta_up_1pct_lots - strategy.delta_lot_equivalent)}
+                    </td>
+                    <td className="px-3 py-3 text-right font-semibold">{formatCurrency(strategy.pnl_up_1pct)}</td>
+                  </tr>
+                  <tr className="border-t border-gray-200 bg-white">
+                    <td className="px-3 py-3 font-semibold">Current</td>
+                    <td className="px-3 py-3 text-right">
+                      {strategy.current_spot_price === null ? "—" : `₹${formatNumber(strategy.current_spot_price)}`}
+                    </td>
+                    <td className="px-3 py-3 text-right font-semibold">{formatLots(strategy.delta_lot_equivalent)}</td>
+                    <td className="px-3 py-3 text-right">—</td>
+                    <td className="px-3 py-3 text-right">—</td>
+                  </tr>
+                  <tr className="border-t border-gray-200 bg-white">
+                    <td className="px-3 py-3 font-semibold">Stock -1%</td>
+                    <td className="px-3 py-3 text-right">
+                      {strategy.current_spot_price === null ? "—" : `₹${formatNumber(strategy.current_spot_price * 0.99)}`}
+                    </td>
+                    <td className="px-3 py-3 text-right font-semibold">{formatLots(strategy.delta_down_1pct_lots)}</td>
+                    <td className="px-3 py-3 text-right">
+                      {strategy.delta_down_1pct_lots === null || strategy.delta_lot_equivalent === null
+                        ? "—"
+                        : formatLots(strategy.delta_down_1pct_lots - strategy.delta_lot_equivalent)}
+                    </td>
+                    <td className="px-3 py-3 text-right font-semibold">{formatCurrency(strategy.pnl_down_1pct)}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
         </section>
 
         <section className="mt-6 grid gap-6 lg:grid-cols-[1.2fr_1fr]">
@@ -2046,7 +2391,7 @@ export default function StrategyDetailsPage() {
             </h2>
 
             <p className="mt-1 text-sm text-gray-500">
-              Futures first, then Calls from higher to lower strikes, then Puts from higher to lower strikes. Greeks are reserved for Sprint 7.
+              Futures first, then Calls from higher to lower strikes, then Puts from higher to lower strikes. Greeks are recalculated from live Zerodha prices on Market Data refresh.
             </p>
           </div>
 
@@ -2760,6 +3105,9 @@ function PositionTable({
                 <tr className="border-t border-gray-200">
                   <td className="p-3 font-semibold">
                     {describePosition(position)}
+                    {position.implied_volatility !== null && (
+                      <span className="ml-2 text-xs font-normal text-gray-500">IV {formatNumber(position.implied_volatility)}%</span>
+                    )}
                   </td>
                   <td className="p-3">{formatDate(position.expiry_date)}</td>
                   <td className="p-3 text-right">{formatNumber(position.open_quantity)}</td>
@@ -2793,10 +3141,10 @@ function PositionTable({
                       {timeRiskLabel(position)}
                     </span>
                   </td>
-                  <td className="p-3 text-right text-gray-400">—</td>
-                  <td className="p-3 text-right text-gray-400">—</td>
-                  <td className="p-3 text-right text-gray-400">—</td>
-                  <td className="p-3 text-right text-gray-400">—</td>
+                  <td className="p-3 text-right font-medium">{formatGreek(position.delta, 2)}</td>
+                  <td className="p-3 text-right font-medium">{position.theta === null ? "—" : formatCurrency(position.theta)}</td>
+                  <td className="p-3 text-right font-medium">{formatGreek(position.gamma, 4)}</td>
+                  <td className="p-3 text-right font-medium">{position.vega === null ? "—" : formatCurrency(position.vega)}</td>
                   <td className="p-3 text-right font-semibold">
                     {formatCurrency(position.realised_pnl)}
                   </td>
@@ -2824,6 +3172,85 @@ function PositionTable({
           })}
         </tbody>
       </table>
+    </div>
+  );
+}
+
+
+type RiskCardProps = {
+  eyebrow: string;
+  title: string;
+  primary: string;
+  secondary: string;
+  note: string;
+};
+
+function RiskCard({ eyebrow, title, primary, secondary, note }: RiskCardProps) {
+  return (
+    <div className="rounded-lg border border-gray-300 bg-white p-5">
+      <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-gray-500">{eyebrow}</p>
+      <p className="mt-1 text-sm font-semibold text-gray-700">{title}</p>
+      <p className="mt-3 text-2xl font-bold">{primary}</p>
+      <p className="mt-2 text-sm font-semibold text-gray-700">{secondary}</p>
+      <p className="mt-2 text-xs leading-5 text-gray-500">{note}</p>
+    </div>
+  );
+}
+
+function formatGreek(value: number | null | undefined, digits = 2) {
+  if (value === null || value === undefined || !Number.isFinite(Number(value))) return "—";
+  const numeric = Number(value);
+  return `${numeric > 0 ? "+" : ""}${numeric.toLocaleString("en-IN", {
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits,
+  })}`;
+}
+
+type GreekCardProps = {
+  label: string;
+  value: string;
+  detail: string;
+};
+
+function GreekCard({ label, value, detail }: GreekCardProps) {
+  return (
+    <div className="rounded-lg border border-gray-200 bg-gray-50 p-4">
+      <p className="text-xs font-semibold uppercase tracking-wide text-gray-500">{label}</p>
+      <p className="mt-2 text-xl font-bold">{value}</p>
+      <p className="mt-2 text-xs leading-5 text-gray-500">{detail}</p>
+    </div>
+  );
+}
+
+type ProfitCaptureCardProps = {
+  capturePct: number | null;
+  unrealisedMtm: number | null;
+  realisticMaxProfit: number | null;
+  bookingZone: boolean;
+};
+
+function ProfitCaptureCard({
+  capturePct,
+  unrealisedMtm,
+  realisticMaxProfit,
+  bookingZone,
+}: ProfitCaptureCardProps) {
+  const label = capturePct === null ? "—" : `${capturePct.toFixed(1)}%`;
+  return (
+    <div className={`rounded-lg border p-5 ${bookingZone ? "border-amber-400 bg-amber-50" : "border-gray-300 bg-white"}`}>
+      <p className={`text-sm ${bookingZone ? "font-semibold text-amber-800" : "text-gray-500"}`}>Profit Capture</p>
+      <p className={`mt-2 text-2xl font-semibold ${bookingZone ? "text-amber-950" : ""}`}>{label}</p>
+      <p className="mt-2 text-xs text-gray-500">
+        {realisticMaxProfit === null
+          ? "Realistic max profit unavailable"
+          : `${formatCurrency(unrealisedMtm)} of ${formatCurrency(realisticMaxProfit)}`}
+      </p>
+      {bookingZone && (
+        <div className="mt-3 rounded border border-amber-300 bg-amber-100 px-3 py-2">
+          <p className="text-xs font-bold uppercase tracking-wide text-amber-900">Profit booking zone</p>
+          <p className="mt-1 text-xs text-amber-800">At least {PROFIT_BOOKING_THRESHOLD}% of the current realistic maximum profit has been captured.</p>
+        </div>
+      )}
     </div>
   );
 }

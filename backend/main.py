@@ -411,6 +411,103 @@ def calculate_position_greeks(
 
 
 
+
+def calculate_position_delta_at_spot(
+    *,
+    position: dict[str, Any],
+    shocked_spot: float,
+    implied_volatility_pct: float | None,
+) -> float | None:
+    """Recalculate position delta at a shocked spot while holding current IV constant."""
+    instrument_type = str(position.get("instrument_type") or "").strip().upper()
+    side = str(position.get("position_side") or "").strip().upper()
+    sign = 1.0 if side == "BUY" else -1.0
+    quantity = float(position.get("open_quantity") or 0)
+    multiplier = float(position.get("contract_multiplier") or 1)
+    exposure = quantity * multiplier
+
+    if instrument_type in {"FUTURE", "EQUITY"}:
+        return sign * exposure
+
+    if instrument_type != "OPTION" or implied_volatility_pct is None:
+        return None
+
+    strike = float(position.get("strike") or 0)
+    option_type = str(position.get("option_type") or "").strip().upper()
+    time_years = _option_time_to_expiry(position.get("expiry_date"))
+    volatility = float(implied_volatility_pct) / 100.0
+
+    if (
+        shocked_spot <= 0
+        or strike <= 0
+        or option_type not in {"CE", "PE"}
+        or time_years is None
+        or volatility <= 0
+    ):
+        return None
+
+    sqrt_t = math.sqrt(time_years)
+    d1 = (
+        math.log(shocked_spot / strike)
+        + (RISK_FREE_RATE - DIVIDEND_YIELD + 0.5 * volatility * volatility) * time_years
+    ) / (volatility * sqrt_t)
+    exp_q = math.exp(-DIVIDEND_YIELD * time_years)
+
+    if option_type == "CE":
+        delta_unit = exp_q * _normal_cdf(d1)
+    else:
+        delta_unit = exp_q * (_normal_cdf(d1) - 1.0)
+
+    return sign * delta_unit * exposure
+
+
+def calculate_position_spot_shock_pnl(
+    *,
+    position: dict[str, Any],
+    current_price: float,
+    current_spot: float,
+    shocked_spot: float,
+    implied_volatility_pct: float | None,
+) -> float | None:
+    """Reprice a leg at shocked spot, holding today's IV and time constant."""
+    instrument_type = str(position.get("instrument_type") or "").strip().upper()
+    side = str(position.get("position_side") or "").strip().upper()
+    sign = 1.0 if side == "BUY" else -1.0
+    quantity = float(position.get("open_quantity") or 0)
+    multiplier = float(position.get("contract_multiplier") or 1)
+    exposure = quantity * multiplier
+
+    if instrument_type in {"FUTURE", "EQUITY"}:
+        return sign * (shocked_spot - current_spot) * exposure
+
+    if instrument_type != "OPTION" or implied_volatility_pct is None:
+        return None
+
+    strike = float(position.get("strike") or 0)
+    option_type = str(position.get("option_type") or "").strip().upper()
+    time_years = _option_time_to_expiry(position.get("expiry_date"))
+    volatility = float(implied_volatility_pct) / 100.0
+
+    if (
+        shocked_spot <= 0
+        or strike <= 0
+        or option_type not in {"CE", "PE"}
+        or time_years is None
+        or volatility <= 0
+    ):
+        return None
+
+    shocked_price = _black_scholes_price(
+        spot=shocked_spot,
+        strike=strike,
+        time_years=time_years,
+        volatility=volatility,
+        option_type=option_type,
+    )
+
+    return sign * (shocked_price - current_price) * exposure
+
+
 def build_margin_orders(positions: list[dict[str, Any]]) -> list[dict[str, Any]]:
     orders: list[dict[str, Any]] = []
 
@@ -1067,6 +1164,79 @@ def refresh_strategy(request: RefreshStrategyRequest) -> dict[str, Any]:
             else None
         )
 
+        futures_lot_size = next(
+            (
+                float(item.get("lot_size") or 0)
+                for item in position_results
+                if float(item.get("lot_size") or 0) > 0
+            ),
+            0.0,
+        )
+        delta_lot_equivalent = (
+            round(strategy_delta / futures_lot_size, 4)
+            if futures_lot_size > 0
+            else None
+        )
+
+        spot_up_1pct = current_spot_price * 1.01
+        spot_down_1pct = current_spot_price * 0.99
+        shocked_delta_up = 0.0
+        shocked_delta_down = 0.0
+        shocked_pnl_up = 0.0
+        shocked_pnl_down = 0.0
+        shock_complete = True
+
+        for position, result in zip(prepared_positions, position_results):
+            iv_pct = result.get("implied_volatility")
+            current_price = float(result.get("current_price") or 0)
+
+            delta_up = calculate_position_delta_at_spot(
+                position=position,
+                shocked_spot=spot_up_1pct,
+                implied_volatility_pct=iv_pct,
+            )
+            delta_down = calculate_position_delta_at_spot(
+                position=position,
+                shocked_spot=spot_down_1pct,
+                implied_volatility_pct=iv_pct,
+            )
+            pnl_up = calculate_position_spot_shock_pnl(
+                position=position,
+                current_price=current_price,
+                current_spot=current_spot_price,
+                shocked_spot=spot_up_1pct,
+                implied_volatility_pct=iv_pct,
+            )
+            pnl_down = calculate_position_spot_shock_pnl(
+                position=position,
+                current_price=current_price,
+                current_spot=current_spot_price,
+                shocked_spot=spot_down_1pct,
+                implied_volatility_pct=iv_pct,
+            )
+
+            if None in {delta_up, delta_down, pnl_up, pnl_down}:
+                shock_complete = False
+                break
+
+            shocked_delta_up += float(delta_up)
+            shocked_delta_down += float(delta_down)
+            shocked_pnl_up += float(pnl_up)
+            shocked_pnl_down += float(pnl_down)
+
+        delta_up_1pct_lots = (
+            round(shocked_delta_up / futures_lot_size, 4)
+            if shock_complete and futures_lot_size > 0
+            else None
+        )
+        delta_down_1pct_lots = (
+            round(shocked_delta_down / futures_lot_size, 4)
+            if shock_complete and futures_lot_size > 0
+            else None
+        )
+        pnl_up_1pct = round(shocked_pnl_up, 2) if shock_complete else None
+        pnl_down_1pct = round(shocked_pnl_down, 2) if shock_complete else None
+
         # Price refresh deliberately does NOT recalculate Zerodha basket margin.
         # Existing margin_used/margin_status remain stored in strategy_master.
         (
@@ -1082,6 +1252,12 @@ def refresh_strategy(request: RefreshStrategyRequest) -> dict[str, Any]:
                     "strategy_theta": strategy_theta,
                     "strategy_vega": strategy_vega,
                     "weighted_iv": weighted_iv,
+                    "futures_lot_size": futures_lot_size or None,
+                    "delta_lot_equivalent": delta_lot_equivalent,
+                    "delta_up_1pct_lots": delta_up_1pct_lots,
+                    "delta_down_1pct_lots": delta_down_1pct_lots,
+                    "pnl_up_1pct": pnl_up_1pct,
+                    "pnl_down_1pct": pnl_down_1pct,
                     "greeks_updated_at": refreshed_at,
                 }
             )
@@ -1110,6 +1286,12 @@ def refresh_strategy(request: RefreshStrategyRequest) -> dict[str, Any]:
             "strategy_theta": strategy_theta,
             "strategy_vega": strategy_vega,
             "weighted_iv": weighted_iv,
+            "futures_lot_size": futures_lot_size or None,
+            "delta_lot_equivalent": delta_lot_equivalent,
+            "delta_up_1pct_lots": delta_up_1pct_lots,
+            "delta_down_1pct_lots": delta_down_1pct_lots,
+            "pnl_up_1pct": pnl_up_1pct,
+            "pnl_down_1pct": pnl_down_1pct,
             "greeks_updated_at": refreshed_at,
             "refreshed_at": refreshed_at,
             "positions": position_results,
