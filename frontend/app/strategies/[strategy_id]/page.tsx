@@ -43,6 +43,13 @@ type Strategy = {
   weighted_iv: number | null;
   futures_lot_size: number | null;
   delta_lot_equivalent: number | null;
+  futures_delta: number | null;
+  options_delta: number | null;
+  equity_delta: number | null;
+  futures_delta_lots: number | null;
+  options_delta_lots: number | null;
+  net_future_contract_lots: number | null;
+  has_futures: boolean | null;
   delta_up_1pct_lots: number | null;
   delta_down_1pct_lots: number | null;
   pnl_up_1pct: number | null;
@@ -171,6 +178,16 @@ function formatCurrency(value: number | null | undefined) {
   ).toLocaleString("en-IN", {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
+  })}`;
+}
+
+function formatWholeCurrency(value: number | null | undefined) {
+  if (value === null || value === undefined || !Number.isFinite(Number(value))) {
+    return "—";
+  }
+  const amount = Math.round(Number(value));
+  return `${amount >= 0 ? "+" : "-"}₹${Math.abs(amount).toLocaleString("en-IN", {
+    maximumFractionDigits: 0,
   })}`;
 }
 
@@ -508,6 +525,13 @@ export default function StrategyDetailsPage() {
             weighted_iv,
             futures_lot_size,
             delta_lot_equivalent,
+            futures_delta,
+            options_delta,
+            equity_delta,
+            futures_delta_lots,
+            options_delta_lots,
+            net_future_contract_lots,
+            has_futures,
             delta_up_1pct_lots,
             delta_down_1pct_lots,
             pnl_up_1pct,
@@ -756,7 +780,7 @@ export default function StrategyDetailsPage() {
 
     const { data: freshStrategy, error: strategySnapshotError } = await supabase
       .from("strategy_master")
-      .select("strategy_id,current_spot_price,realised_pnl,unrealised_mtm,total_pnl,margin_used,strategy_delta,strategy_gamma,strategy_theta,strategy_vega,weighted_iv")
+      .select("strategy_id,current_spot_price,realised_pnl,unrealised_mtm,total_pnl,margin_used,strategy_delta,strategy_gamma,strategy_theta,strategy_vega,weighted_iv,futures_lot_size,delta_lot_equivalent,futures_delta_lots,options_delta_lots,net_future_contract_lots,has_futures,delta_up_1pct_lots,delta_down_1pct_lots,pnl_up_1pct,pnl_down_1pct")
       .eq("strategy_id", strategy.strategy_id)
       .single();
 
@@ -821,6 +845,20 @@ export default function StrategyDetailsPage() {
         strategy_theta: freshStrategy.strategy_theta,
         strategy_vega: freshStrategy.strategy_vega,
         weighted_iv: freshStrategy.weighted_iv,
+        futures_lot_size: freshStrategy.futures_lot_size,
+        delta_lot_equivalent: freshStrategy.delta_lot_equivalent,
+        futures_delta_lots: freshStrategy.futures_delta_lots,
+        options_delta_lots: freshStrategy.options_delta_lots,
+        net_future_contract_lots: freshStrategy.net_future_contract_lots,
+        has_futures: freshStrategy.has_futures,
+        delta_up_1pct_lots: freshStrategy.delta_up_1pct_lots,
+        delta_down_1pct_lots: freshStrategy.delta_down_1pct_lots,
+        pnl_up_1pct: freshStrategy.pnl_up_1pct,
+        pnl_down_1pct: freshStrategy.pnl_down_1pct,
+        theta_efficiency_per_lakh:
+          freshStrategy.margin_used && Number(freshStrategy.margin_used) > 0
+            ? (Number(freshStrategy.strategy_theta ?? 0) / Number(freshStrategy.margin_used)) * 100000
+            : null,
       }, { onConflict: "strategy_id,snapshot_date" });
 
     if (snapshotError) throw new Error(snapshotError.message);
@@ -1248,6 +1286,13 @@ export default function StrategyDetailsPage() {
             weighted_iv,
             futures_lot_size,
             delta_lot_equivalent,
+            futures_delta,
+            options_delta,
+            equity_delta,
+            futures_delta_lots,
+            options_delta_lots,
+            net_future_contract_lots,
+            has_futures,
             delta_up_1pct_lots,
             delta_down_1pct_lots,
             pnl_up_1pct,
@@ -2044,11 +2089,11 @@ export default function StrategyDetailsPage() {
             <RiskCard
               eyebrow="Reward for waiting"
               title="Theta"
-              primary={strategy.strategy_theta === null ? "—" : `${formatCurrency(strategy.strategy_theta)} / day`}
+              primary={strategy.strategy_theta === null ? "—" : `${formatWholeCurrency(strategy.strategy_theta)} / day`}
               secondary={
                 thetaEfficiencyPerLakh === null
                   ? "Theta efficiency unavailable"
-                  : `${formatCurrency(thetaEfficiencyPerLakh)} / ₹1L margin / day`
+                  : `${formatWholeCurrency(thetaEfficiencyPerLakh)} / ₹1L margin / day`
               }
               note="Model estimate for one calendar day with spot and IV broadly unchanged."
             />
@@ -2061,18 +2106,20 @@ export default function StrategyDetailsPage() {
               note={
                 strategy.strategy_delta === null || strategy.futures_lot_size === null
                   ? "Refresh market data to calculate futures-lot equivalent."
-                  : `${formatNumber(strategy.strategy_delta)} share-equivalent delta · 1 futures lot = ${formatNumber(strategy.futures_lot_size)} shares`
+                  : strategy.has_futures
+                    ? `Options ${formatLots(strategy.options_delta_lots)} · Futures ${formatLots(strategy.futures_delta_lots)} · net futures held ${formatLots(strategy.net_future_contract_lots)} · 1 futures lot = ${formatNumber(strategy.futures_lot_size)} shares`
+                    : `Options ${formatLots(strategy.options_delta_lots)} · ${formatNumber(strategy.strategy_delta)} share-equivalent delta · 1 futures lot = ${formatNumber(strategy.futures_lot_size)} shares`
               }
             />
 
             <RiskCard
               eyebrow="Volatility exposure"
               title="Vega"
-              primary={strategy.strategy_vega === null ? "—" : `${formatCurrency(strategy.strategy_vega)} / IV pt`}
+              primary={strategy.strategy_vega === null ? "—" : `${formatWholeCurrency(strategy.strategy_vega)} / IV pt`}
               secondary={
                 vegaFivePointShock === null
                   ? "5-point IV shock unavailable"
-                  : `+5 IV pts ≈ ${formatCurrency(vegaFivePointShock)}`
+                  : `+5 IV pts ≈ ${formatWholeCurrency(vegaFivePointShock)}`
               }
               note={
                 strategy.weighted_iv === null
@@ -2130,7 +2177,7 @@ export default function StrategyDetailsPage() {
                         ? "—"
                         : formatLots(strategy.delta_up_1pct_lots - strategy.delta_lot_equivalent)}
                     </td>
-                    <td className="px-3 py-3 text-right font-semibold">{formatCurrency(strategy.pnl_up_1pct)}</td>
+                    <td className="px-3 py-3 text-right font-semibold">{formatWholeCurrency(strategy.pnl_up_1pct)}</td>
                   </tr>
                   <tr className="border-t border-gray-200 bg-white">
                     <td className="px-3 py-3 font-semibold">Current</td>
@@ -2152,10 +2199,28 @@ export default function StrategyDetailsPage() {
                         ? "—"
                         : formatLots(strategy.delta_down_1pct_lots - strategy.delta_lot_equivalent)}
                     </td>
-                    <td className="px-3 py-3 text-right font-semibold">{formatCurrency(strategy.pnl_down_1pct)}</td>
+                    <td className="px-3 py-3 text-right font-semibold">{formatWholeCurrency(strategy.pnl_down_1pct)}</td>
                   </tr>
                 </tbody>
               </table>
+            </div>
+
+            <div className="mt-4 grid gap-3 md:grid-cols-3">
+              <div className="rounded border border-gray-200 bg-white p-4">
+                <p className="text-xs font-semibold uppercase tracking-wide text-gray-500">Options delta</p>
+                <p className="mt-1 text-lg font-bold">{formatLots(strategy.options_delta_lots)}</p>
+                <p className="mt-1 text-xs text-gray-500">Nonlinear exposure. This is the component that changes as option delta and gamma evolve.</p>
+              </div>
+              <div className="rounded border border-gray-200 bg-white p-4">
+                <p className="text-xs font-semibold uppercase tracking-wide text-gray-500">Futures delta</p>
+                <p className="mt-1 text-lg font-bold">{formatLots(strategy.futures_delta_lots)}</p>
+                <p className="mt-1 text-xs text-gray-500">Linear exposure from open futures. One long futures lot contributes approximately +1.00 delta lot.</p>
+              </div>
+              <div className="rounded border border-gray-200 bg-white p-4">
+                <p className="text-xs font-semibold uppercase tracking-wide text-gray-500">Net strategy delta</p>
+                <p className="mt-1 text-lg font-bold">{formatLots(strategy.delta_lot_equivalent)}</p>
+                <p className="mt-1 text-xs text-gray-500">Options + futures combined. Futures shift the level of delta; options drive most of the gamma-driven change.</p>
+              </div>
             </div>
           </div>
         </section>

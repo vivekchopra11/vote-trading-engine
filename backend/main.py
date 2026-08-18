@@ -1164,19 +1164,84 @@ def refresh_strategy(request: RefreshStrategyRequest) -> dict[str, Any]:
             else None
         )
 
+        # Normalize directional exposure into futures-lot equivalents.
+        # Prefer an actual futures contract lot size; otherwise use the derivative
+        # lot size from an option on the same underlying. This keeps +1.00 lots
+        # comparable across stocks regardless of the underlying price.
         futures_lot_size = next(
             (
                 float(item.get("lot_size") or 0)
                 for item in position_results
-                if float(item.get("lot_size") or 0) > 0
+                if str(item.get("instrument_type") or "").strip().upper() == "FUTURE"
+                and float(item.get("lot_size") or 0) > 0
             ),
             0.0,
         )
+        if futures_lot_size <= 0:
+            futures_lot_size = next(
+                (
+                    float(item.get("lot_size") or 0)
+                    for item in position_results
+                    if str(item.get("instrument_type") or "").strip().upper() == "OPTION"
+                    and float(item.get("lot_size") or 0) > 0
+                ),
+                0.0,
+            )
+
+        futures_delta = round(
+            sum(
+                float(item.get("delta") or 0)
+                for item in position_results
+                if str(item.get("instrument_type") or "").strip().upper() == "FUTURE"
+            ),
+            4,
+        )
+        options_delta = round(
+            sum(
+                float(item.get("delta") or 0)
+                for item in position_results
+                if str(item.get("instrument_type") or "").strip().upper() == "OPTION"
+            ),
+            4,
+        )
+        equity_delta = round(
+            sum(
+                float(item.get("delta") or 0)
+                for item in position_results
+                if str(item.get("instrument_type") or "").strip().upper() == "EQUITY"
+            ),
+            4,
+        )
+
         delta_lot_equivalent = (
             round(strategy_delta / futures_lot_size, 4)
             if futures_lot_size > 0
             else None
         )
+        futures_delta_lots = (
+            round(futures_delta / futures_lot_size, 4)
+            if futures_lot_size > 0
+            else None
+        )
+        options_delta_lots = (
+            round(options_delta / futures_lot_size, 4)
+            if futures_lot_size > 0
+            else None
+        )
+
+        net_future_contract_lots = 0.0
+        has_futures = False
+        for position in prepared_positions:
+            if str(position.get("instrument_type") or "").strip().upper() != "FUTURE":
+                continue
+            has_futures = True
+            side = str(position.get("position_side") or "").strip().upper()
+            sign = 1.0 if side == "BUY" else -1.0
+            quantity = float(position.get("open_quantity") or 0)
+            lot_size = float(position.get("lot_size") or futures_lot_size or 0)
+            if lot_size > 0:
+                net_future_contract_lots += sign * (quantity / lot_size)
+        net_future_contract_lots = round(net_future_contract_lots, 4)
 
         spot_up_1pct = current_spot_price * 1.01
         spot_down_1pct = current_spot_price * 0.99
@@ -1254,6 +1319,13 @@ def refresh_strategy(request: RefreshStrategyRequest) -> dict[str, Any]:
                     "weighted_iv": weighted_iv,
                     "futures_lot_size": futures_lot_size or None,
                     "delta_lot_equivalent": delta_lot_equivalent,
+                    "futures_delta": futures_delta,
+                    "options_delta": options_delta,
+                    "equity_delta": equity_delta,
+                    "futures_delta_lots": futures_delta_lots,
+                    "options_delta_lots": options_delta_lots,
+                    "net_future_contract_lots": net_future_contract_lots,
+                    "has_futures": has_futures,
                     "delta_up_1pct_lots": delta_up_1pct_lots,
                     "delta_down_1pct_lots": delta_down_1pct_lots,
                     "pnl_up_1pct": pnl_up_1pct,
@@ -1288,6 +1360,13 @@ def refresh_strategy(request: RefreshStrategyRequest) -> dict[str, Any]:
             "weighted_iv": weighted_iv,
             "futures_lot_size": futures_lot_size or None,
             "delta_lot_equivalent": delta_lot_equivalent,
+            "futures_delta": futures_delta,
+            "options_delta": options_delta,
+            "equity_delta": equity_delta,
+            "futures_delta_lots": futures_delta_lots,
+            "options_delta_lots": options_delta_lots,
+            "net_future_contract_lots": net_future_contract_lots,
+            "has_futures": has_futures,
             "delta_up_1pct_lots": delta_up_1pct_lots,
             "delta_down_1pct_lots": delta_down_1pct_lots,
             "pnl_up_1pct": pnl_up_1pct,
