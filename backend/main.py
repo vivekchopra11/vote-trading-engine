@@ -1,5 +1,7 @@
 import os
 import math
+import time as time_module
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, time, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -1382,6 +1384,106 @@ def refresh_strategy(request: RefreshStrategyRequest) -> dict[str, Any]:
         raise HTTPException(
             status_code=500,
             detail=f"Unable to refresh strategy market data: {str(exc)}",
+        ) from exc
+
+
+@app.post("/market/refresh-portfolio")
+def refresh_portfolio_market_data() -> dict[str, Any]:
+    """Refresh all open strategies through one browser/backend request.
+
+    The strategy refresh calculation remains canonical in refresh_strategy().
+    Work is parallelised inside the backend so the browser does not have to
+    issue many simultaneous requests through the Next.js proxy. Margin and
+    observation calculations remain excluded from this market-data path.
+    """
+    database = get_supabase()
+    started_at = time_module.perf_counter()
+
+    try:
+        response = (
+            database.table("strategy_master")
+            .select("strategy_id,strategy_name,status")
+            .eq("status", "OPEN")
+            .execute()
+        )
+        strategies = response.data or []
+
+        if not strategies:
+            return {
+                "status": "success",
+                "refresh_mode": "PORTFOLIO_PARALLEL",
+                "strategies_total": 0,
+                "strategies_updated": 0,
+                "strategies_failed": 0,
+                "results": [],
+                "refreshed_at": datetime.now(IST).isoformat(),
+                "duration_seconds": 0.0,
+            }
+
+        # Three workers is intentionally conservative: it removes the long
+        # sequential wait while avoiding an unbounded burst of broker calls.
+        max_workers = min(3, len(strategies))
+        results: list[dict[str, Any]] = []
+
+        def run_one(row: dict[str, Any]) -> dict[str, Any]:
+            strategy_id = str(row["strategy_id"])
+            try:
+                result = refresh_strategy(
+                    RefreshStrategyRequest(strategy_id=strategy_id)
+                )
+                return {
+                    "strategy_id": strategy_id,
+                    "strategy_name": row.get("strategy_name"),
+                    "status": "SUCCESS",
+                    "result": result,
+                }
+            except HTTPException as exc:
+                return {
+                    "strategy_id": strategy_id,
+                    "strategy_name": row.get("strategy_name"),
+                    "status": "ERROR",
+                    "message": str(exc.detail),
+                }
+            except Exception as exc:
+                return {
+                    "strategy_id": strategy_id,
+                    "strategy_name": row.get("strategy_name"),
+                    "status": "ERROR",
+                    "message": str(exc),
+                }
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(run_one, row) for row in strategies]
+            for future in as_completed(futures):
+                results.append(future.result())
+
+        order = {
+            str(row["strategy_id"]): index
+            for index, row in enumerate(strategies)
+        }
+        results.sort(key=lambda item: order.get(item["strategy_id"], 10**9))
+
+        updated = sum(1 for item in results if item["status"] == "SUCCESS")
+        failed = len(results) - updated
+        duration = round(time_module.perf_counter() - started_at, 3)
+
+        return {
+            "status": "success" if failed == 0 else "partial_success",
+            "refresh_mode": "PORTFOLIO_PARALLEL",
+            "strategies_total": len(strategies),
+            "strategies_updated": updated,
+            "strategies_failed": failed,
+            "workers": max_workers,
+            "results": results,
+            "refreshed_at": datetime.now(IST).isoformat(),
+            "duration_seconds": duration,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unable to refresh portfolio market data: {str(exc)}",
         ) from exc
 
 

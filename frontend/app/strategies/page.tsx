@@ -7,6 +7,8 @@ import { supabase } from "@/lib/supabase";
 const ZERODHA_LOGIN_URL =
   "https://vote-trading-engine-1.onrender.com/auth/zerodha/login";
 
+const CONCENTRATION_LIMIT_PCT = 30;
+
 type Strategy = {
   strategy_id: string;
   strategy_name: string;
@@ -24,17 +26,24 @@ type Strategy = {
   margin_status: string | null;
   margin_updated_at: string | null;
   market_data_updated_at: string | null;
+  strategy_theta: number | null;
+  delta_lot_equivalent: number | null;
 };
 
-type MonthGroup = {
-  monthKey: string;
-  monthLabel: string;
-  active: Strategy[];
-  closed: Strategy[];
-  realised: number;
-  unrealised: number;
-  net: number;
-  margin: number;
+type DailySnapshot = {
+  strategy_id: string;
+  snapshot_date: string;
+  captured_at: string;
+  unrealised_mtm: number | null;
+  realised_pnl: number | null;
+  total_pnl: number | null;
+  unrealised_capture_pct: number | null;
+  nearest_dte: number | null;
+};
+
+type Closure = {
+  close_date: string;
+  realised_pnl: number | null;
 };
 
 type RefreshState = {
@@ -42,22 +51,36 @@ type RefreshState = {
   message?: string;
 };
 
-function monthKeyForStrategy(strategy: Strategy) {
-  return (strategy.expiry_month || strategy.entry_date).slice(0, 7);
-}
-
-function formatMonth(monthKey: string) {
-  const [year, month] = monthKey.split("-").map(Number);
-  return new Intl.DateTimeFormat("en-GB", {
-    month: "long",
-    year: "numeric",
-  }).format(new Date(year, month - 1, 1));
-}
-
-function formatCurrency(value: number | null | undefined, showPlus = true) {
+function formatCurrency(
+  value: number | null | undefined,
+  showPlus = true,
+) {
   const amount = Number(value ?? 0);
   const sign = amount < 0 ? "-" : showPlus && amount > 0 ? "+" : "";
+
   return `${sign}₹${Math.abs(amount).toLocaleString("en-IN", {
+    maximumFractionDigits: 0,
+  })}`;
+}
+
+function formatCompactCurrency(value: number | null | undefined) {
+  const amount = Number(value ?? 0);
+  const absolute = Math.abs(amount);
+  const sign = amount < 0 ? "-" : amount > 0 ? "+" : "";
+
+  if (absolute >= 10_000_000) {
+    return `${sign}₹${(absolute / 10_000_000).toFixed(2)}Cr`;
+  }
+
+  if (absolute >= 100_000) {
+    return `${sign}₹${(absolute / 100_000).toFixed(2)}L`;
+  }
+
+  if (absolute >= 1_000) {
+    return `${sign}₹${(absolute / 1_000).toFixed(1)}K`;
+  }
+
+  return `${sign}₹${absolute.toLocaleString("en-IN", {
     maximumFractionDigits: 0,
   })}`;
 }
@@ -75,70 +98,231 @@ function requiresReconnect(message: string) {
     text.includes("expired") ||
     text.includes("authenticate") ||
     text.includes("not connected") ||
-    text.includes("zerodha session")
+    text.includes("zerodha session") ||
+    text.includes("access token")
   );
 }
 
-function StrategyRow({ strategy }: { strategy: Strategy }) {
+function formatExpiryMonth(value: string | null) {
+  if (!value) return "—";
+  const month = value.slice(0, 7);
+  const [year, monthNumber] = month.split("-").map(Number);
+  if (!year || !monthNumber) return value;
+
+  return new Intl.DateTimeFormat("en-GB", {
+    month: "short",
+    year: "numeric",
+  }).format(new Date(year, monthNumber - 1, 1));
+}
+
+function concentrationTone(concentrationPct: number) {
+  if (concentrationPct >= CONCENTRATION_LIMIT_PCT) {
+    return {
+      bar: "bg-red-500",
+      text: "text-red-700",
+      label: "Concentration limit exceeded",
+      border: "border-red-200",
+      background: "bg-red-50/40",
+    };
+  }
+
+  if (concentrationPct >= 25) {
+    return {
+      bar: "bg-amber-500",
+      text: "text-amber-700",
+      label: "Approaching 30% limit",
+      border: "border-amber-200",
+      background: "bg-amber-50/30",
+    };
+  }
+
+  return {
+    bar: "bg-gray-900",
+    text: "text-gray-500",
+    label: "Within concentration limit",
+    border: "border-gray-200",
+    background: "bg-white",
+  };
+}
+
+function PortfolioMetric({
+  label,
+  value,
+  subtext,
+  valueClassName = "text-gray-950",
+}: {
+  label: string;
+  value: string;
+  subtext?: string;
+  valueClassName?: string;
+}) {
+  return (
+    <div className="min-w-0">
+      <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-gray-500">
+        {label}
+      </p>
+      <p className={`mt-1 text-xl font-semibold ${valueClassName}`}>
+        {value}
+      </p>
+      {subtext && <p className="mt-1 text-xs text-gray-500">{subtext}</p>}
+    </div>
+  );
+}
+
+function StrategyCard({
+  strategy,
+  concentrationPct,
+  latestSnapshot,
+  previousSnapshot,
+}: {
+  strategy: Strategy;
+  concentrationPct: number;
+  latestSnapshot: DailySnapshot | null;
+  previousSnapshot: DailySnapshot | null;
+}) {
+  const currentMtm = Number(strategy.unrealised_mtm ?? 0);
+  const previousMtm = previousSnapshot
+    ? Number(previousSnapshot.unrealised_mtm ?? 0)
+    : null;
+  const mtmChange = previousMtm === null ? null : currentMtm - previousMtm;
+
+  const capturePct = latestSnapshot?.unrealised_capture_pct ?? null;
+  const dte = latestSnapshot?.nearest_dte ?? null;
+  const deltaLots = strategy.delta_lot_equivalent;
+  const theta = strategy.strategy_theta;
+  const tone = concentrationTone(concentrationPct);
+
   return (
     <Link
       href={`/strategies/${encodeURIComponent(strategy.strategy_id)}`}
-      className="block border-t border-gray-200 px-5 py-4 transition hover:bg-gray-50"
+      className={`group block rounded-2xl border ${tone.border} ${tone.background} p-5 shadow-sm transition hover:-translate-y-0.5 hover:shadow-md`}
     >
-      <div className="grid gap-4 xl:grid-cols-[minmax(240px,1.7fr)_repeat(4,minmax(120px,1fr))] xl:items-center">
-        <div>
-          <div className="flex items-center gap-2">
-            <span className="text-sm font-semibold text-gray-500">
+      <div className="flex items-start justify-between gap-4">
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <p className="text-xs font-bold uppercase tracking-[0.14em] text-gray-500">
               {strategy.symbol}
-            </span>
-            <span
-              className={`rounded-full border px-2 py-0.5 text-xs font-semibold ${
-                strategy.status === "CLOSED"
-                  ? "border-gray-300 bg-gray-100 text-gray-700"
-                  : "border-emerald-300 bg-emerald-50 text-emerald-800"
-              }`}
-            >
-              {strategy.status}
+            </p>
+            <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] font-semibold text-emerald-700">
+              OPEN
             </span>
           </div>
-          <p className="mt-1 font-semibold text-gray-950">
+          <h2 className="mt-2 truncate text-lg font-semibold text-gray-950">
             {strategy.strategy_name}
+          </h2>
+          <p className="mt-1 text-xs text-gray-500">
+            Expiry {formatExpiryMonth(strategy.expiry_month)}
+          </p>
+        </div>
+
+        <div className="shrink-0 text-right">
+          <p className="text-[11px] font-semibold uppercase tracking-wide text-gray-400">
+            DTE
+          </p>
+          <p className="mt-1 text-xl font-semibold text-gray-900">
+            {dte === null ? "—" : dte}
+          </p>
+        </div>
+      </div>
+
+      <div className="mt-5 border-t border-gray-200 pt-4">
+        <div className="flex items-end justify-between gap-4">
+          <div>
+            <p className="text-[11px] font-semibold uppercase tracking-wide text-gray-500">
+              MTM today
+            </p>
+            <p className={`mt-1 text-2xl font-semibold ${pnlClass(currentMtm)}`}>
+              {formatCurrency(currentMtm)}
+            </p>
+          </div>
+
+          <div className="text-right">
+            <p className="text-[11px] text-gray-500">vs previous snapshot</p>
+            <p
+              className={`mt-1 text-sm font-semibold ${
+                mtmChange === null ? "text-gray-400" : pnlClass(mtmChange)
+              }`}
+            >
+              {mtmChange === null ? "—" : formatCurrency(mtmChange)}
+            </p>
+          </div>
+        </div>
+      </div>
+
+      <div className="mt-5 grid grid-cols-2 gap-x-5 gap-y-4">
+        <div>
+          <p className="text-[11px] font-semibold uppercase tracking-wide text-gray-500">
+            Profit capture
+          </p>
+          <p
+            className={`mt-1 text-lg font-semibold ${
+              capturePct !== null && capturePct >= 70
+                ? "text-amber-700"
+                : "text-gray-950"
+            }`}
+          >
+            {capturePct === null ? "—" : `${capturePct.toFixed(1)}%`}
+          </p>
+          {capturePct !== null && capturePct >= 70 && (
+            <p className="mt-1 text-[11px] font-semibold text-amber-700">
+              Profit booking zone
+            </p>
+          )}
+        </div>
+
+        <div>
+          <p className="text-[11px] font-semibold uppercase tracking-wide text-gray-500">
+            Capital concentration
+          </p>
+          <p className={`mt-1 text-lg font-semibold ${tone.text}`}>
+            {concentrationPct.toFixed(1)}%
+          </p>
+          <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-gray-100">
+            <div
+              className={`h-full rounded-full ${tone.bar}`}
+              style={{
+                width: `${Math.min(100, (concentrationPct / CONCENTRATION_LIMIT_PCT) * 100)}%`,
+              }}
+            />
+          </div>
+          <p className={`mt-1 text-[11px] ${tone.text}`}>{tone.label}</p>
+        </div>
+
+        <div>
+          <p className="text-[11px] font-semibold uppercase tracking-wide text-gray-500">
+            Delta
+          </p>
+          <p className="mt-1 text-lg font-semibold text-gray-950">
+            {deltaLots === null || deltaLots === undefined
+              ? "—"
+              : `${deltaLots >= 0 ? "+" : ""}${Number(deltaLots).toFixed(2)} lots`}
           </p>
         </div>
 
         <div>
-          <p className="text-xs text-gray-500">Realised P&amp;L</p>
-          <p className={`font-semibold ${pnlClass(strategy.realised_pnl)}`}>
-            {formatCurrency(strategy.realised_pnl)}
+          <p className="text-[11px] font-semibold uppercase tracking-wide text-gray-500">
+            Theta
+          </p>
+          <p className="mt-1 text-lg font-semibold text-gray-950">
+            {theta === null || theta === undefined
+              ? "—"
+              : `${formatCurrency(theta)} / day`}
           </p>
         </div>
+      </div>
 
+      <div className="mt-5 flex items-center justify-between border-t border-gray-200 pt-4">
         <div>
-          <p className="text-xs text-gray-500">Unrealised MTM</p>
-          <p className={`font-semibold ${pnlClass(strategy.unrealised_mtm)}`}>
-            {formatCurrency(strategy.unrealised_mtm)}
-          </p>
-        </div>
-
-        <div>
-          <p className="text-xs text-gray-500">Net P&amp;L</p>
-          <p className={`font-semibold ${pnlClass(strategy.total_pnl)}`}>
-            {formatCurrency(strategy.total_pnl)}
-          </p>
-        </div>
-
-        <div>
-          <p className="text-xs text-gray-500">Capital Deployed</p>
-          <p className="font-semibold text-gray-950">
+          <p className="text-[11px] text-gray-500">Margin used</p>
+          <p className="mt-0.5 text-sm font-semibold text-gray-800">
             {Number(strategy.margin_used ?? 0) > 0
-              ? formatCurrency(strategy.margin_used, false)
+              ? formatCompactCurrency(strategy.margin_used)
               : "—"}
           </p>
-          {strategy.status !== "CLOSED" &&
-            strategy.margin_status !== "CURRENT" && (
-              <p className="text-xs text-amber-700">Refresh required</p>
-            )}
         </div>
+        <span className="text-sm font-semibold text-gray-600 transition group-hover:text-gray-950">
+          Open strategy →
+        </span>
       </div>
     </Link>
   );
@@ -146,8 +330,11 @@ function StrategyRow({ strategy }: { strategy: Strategy }) {
 
 export default function StrategiesPage() {
   const [strategies, setStrategies] = useState<Strategy[]>([]);
+  const [dailySnapshots, setDailySnapshots] = useState<DailySnapshot[]>([]);
+  const [closures, setClosures] = useState<Closure[]>([]);
   const [loading, setLoading] = useState(true);
   const [errorMessage, setErrorMessage] = useState("");
+
   const [refreshingAll, setRefreshingAll] = useState(false);
   const [refreshError, setRefreshError] = useState("");
   const [refreshStates, setRefreshStates] = useState<Record<string, RefreshState>>({});
@@ -155,90 +342,161 @@ export default function StrategiesPage() {
   const [refreshTotal, setRefreshTotal] = useState(0);
   const [lastRefreshDurationMs, setLastRefreshDurationMs] = useState<number | null>(null);
   const [lastPortfolioRefresh, setLastPortfolioRefresh] = useState<string | null>(null);
-  const [monthOpenState, setMonthOpenState] = useState<Record<string, boolean>>({});
-  const [closedOpenState, setClosedOpenState] = useState<Record<string, boolean>>({});
-
-  const currentMonthKey = new Date().toISOString().slice(0, 7);
 
   async function loadData(showLoader = false) {
     if (showLoader) setLoading(true);
     setErrorMessage("");
 
-    const { data, error } = await supabase
-      .from("strategy_master")
-      .select(
-        `strategy_id,strategy_name,symbol,strategy_type,direction,status,entry_date,expiry_month,closed_date,realised_pnl,unrealised_mtm,total_pnl,margin_used,margin_status,margin_updated_at,market_data_updated_at`,
-      )
-      .order("entry_date", { ascending: false });
+    const currentMonthStart = `${new Date().toISOString().slice(0, 7)}-01`;
 
-    if (error) {
-      setErrorMessage(error.message);
-    } else {
-      setStrategies(data ?? []);
-      const timestamps = (data ?? [])
+    const [strategiesResponse, snapshotsResponse, closuresResponse] =
+      await Promise.all([
+        supabase
+          .from("strategy_master")
+          .select(
+            `strategy_id,strategy_name,symbol,strategy_type,direction,status,entry_date,expiry_month,closed_date,realised_pnl,unrealised_mtm,total_pnl,margin_used,margin_status,margin_updated_at,market_data_updated_at,strategy_theta,delta_lot_equivalent`,
+          )
+          .order("entry_date", { ascending: false }),
+
+        supabase
+          .from("strategy_daily_snapshots")
+          .select(
+            "strategy_id,snapshot_date,captured_at,unrealised_mtm,realised_pnl,total_pnl,unrealised_capture_pct,nearest_dte",
+          )
+          .order("snapshot_date", { ascending: false })
+          .order("captured_at", { ascending: false })
+          .limit(500),
+
+        supabase
+          .from("position_closures")
+          .select("close_date,realised_pnl")
+          .gte("close_date", currentMonthStart),
+      ]);
+
+    try {
+      if (strategiesResponse.error) {
+        throw new Error(strategiesResponse.error.message);
+      }
+
+      if (snapshotsResponse.error) {
+        throw new Error(snapshotsResponse.error.message);
+      }
+
+      if (closuresResponse.error) {
+        throw new Error(closuresResponse.error.message);
+      }
+
+      const loadedStrategies = (strategiesResponse.data ?? []) as Strategy[];
+      setStrategies(loadedStrategies);
+      setDailySnapshots((snapshotsResponse.data ?? []) as DailySnapshot[]);
+      setClosures((closuresResponse.data ?? []) as Closure[]);
+
+      const timestamps = loadedStrategies
         .map((item) => item.market_data_updated_at)
         .filter(Boolean)
         .map((value) => new Date(value as string).getTime())
         .filter(Number.isFinite);
+
       if (timestamps.length > 0) {
         setLastPortfolioRefresh(new Date(Math.max(...timestamps)).toISOString());
       }
+    } catch (error) {
+      setErrorMessage(
+        error instanceof Error ? error.message : "Unable to load portfolio.",
+      );
+    } finally {
+      if (showLoader) setLoading(false);
     }
-
-    if (showLoader) setLoading(false);
   }
 
   useEffect(() => {
     void loadData(true);
   }, []);
 
-  const monthGroups = useMemo<MonthGroup[]>(() => {
-    const grouped = new Map<string, Strategy[]>();
-    strategies.forEach((strategy) => {
-      const key = monthKeyForStrategy(strategy);
-      grouped.set(key, [...(grouped.get(key) ?? []), strategy]);
+  const openStrategies = useMemo(
+    () => strategies.filter((strategy) => strategy.status !== "CLOSED"),
+    [strategies],
+  );
+
+  const closedStrategies = useMemo(
+    () => strategies.filter((strategy) => strategy.status === "CLOSED"),
+    [strategies],
+  );
+
+  const snapshotsByStrategy = useMemo(() => {
+    const grouped = new Map<string, DailySnapshot[]>();
+
+    dailySnapshots.forEach((snapshot) => {
+      const current = grouped.get(snapshot.strategy_id) ?? [];
+      current.push(snapshot);
+      grouped.set(snapshot.strategy_id, current);
     });
 
-    return Array.from(grouped.entries())
-      .map(([monthKey, items]) => {
-        const active = items.filter((item) => item.status !== "CLOSED");
-        const closed = items.filter((item) => item.status === "CLOSED");
-        const realised = items.reduce(
-          (sum, item) => sum + Number(item.realised_pnl ?? 0),
-          0,
-        );
-        const unrealised = active.reduce(
-          (sum, item) => sum + Number(item.unrealised_mtm ?? 0),
-          0,
-        );
-        const margin = active.reduce(
-          (sum, item) => sum + Number(item.margin_used ?? 0),
-          0,
-        );
+    grouped.forEach((items, strategyId) => {
+      grouped.set(
+        strategyId,
+        [...items].sort((a, b) => {
+          const dateCompare = b.snapshot_date.localeCompare(a.snapshot_date);
+          if (dateCompare !== 0) return dateCompare;
+          return (
+            new Date(b.captured_at).getTime() -
+            new Date(a.captured_at).getTime()
+          );
+        }),
+      );
+    });
 
-        return {
-          monthKey,
-          monthLabel: formatMonth(monthKey),
-          active,
-          closed,
-          realised,
-          unrealised,
-          net: realised + unrealised,
-          margin,
-        };
-      })
-      .sort((a, b) => b.monthKey.localeCompare(a.monthKey));
-  }, [strategies]);
+    return grouped;
+  }, [dailySnapshots]);
+
+  const totalCapitalDeployed = useMemo(
+    () =>
+      openStrategies.reduce(
+        (sum, strategy) => sum + Number(strategy.margin_used ?? 0),
+        0,
+      ),
+    [openStrategies],
+  );
+
+  const currentPortfolioMtm = useMemo(
+    () =>
+      openStrategies.reduce(
+        (sum, strategy) => sum + Number(strategy.unrealised_mtm ?? 0),
+        0,
+      ),
+    [openStrategies],
+  );
+
+  const portfolioTheta = useMemo(
+    () =>
+      openStrategies.reduce(
+        (sum, strategy) => sum + Number(strategy.strategy_theta ?? 0),
+        0,
+      ),
+    [openStrategies],
+  );
+
+  const realisedThisMonth = useMemo(
+    () =>
+      closures.reduce(
+        (sum, closure) => sum + Number(closure.realised_pnl ?? 0),
+        0,
+      ),
+    [closures],
+  );
+
+  const sortedOpenStrategies = useMemo(() => {
+    return [...openStrategies].sort((a, b) => {
+      const bMargin = Number(b.margin_used ?? 0);
+      const aMargin = Number(a.margin_used ?? 0);
+      return bMargin - aMargin;
+    });
+  }, [openStrategies]);
 
   async function refreshAllMarketData() {
-    const openStrategies = strategies.filter(
-      (strategy) => strategy.status !== "CLOSED",
-    );
-
     if (openStrategies.length === 0 || refreshingAll) return;
 
     const startedAt = performance.now();
-    const concurrency = Math.min(3, openStrategies.length);
 
     setRefreshingAll(true);
     setRefreshError("");
@@ -249,141 +507,152 @@ export default function StrategiesPage() {
       Object.fromEntries(
         openStrategies.map((strategy) => [
           strategy.strategy_id,
-          { status: "PENDING" },
+          { status: "REFRESHING" },
         ]),
       ),
     );
 
-    let nextIndex = 0;
-    let firstError = "";
+    try {
+      const response = await fetch("/api/market/refresh-portfolio", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+      });
 
-    async function refreshOne(strategy: Strategy) {
-      setRefreshStates((current) => ({
-        ...current,
-        [strategy.strategy_id]: { status: "REFRESHING" },
-      }));
+      const payload = await response.json().catch(() => ({}));
 
-      try {
-        const response = await fetch("/api/market/refresh-strategy", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ strategy_id: strategy.strategy_id }),
-        });
+      if (!response.ok) {
+        const message =
+          typeof payload?.detail === "string"
+            ? payload.detail
+            : "Unable to refresh portfolio market data.";
+        throw new Error(message);
+      }
 
-        const payload = await response.json().catch(() => ({}));
+      const results = Array.isArray(payload?.results)
+        ? payload.results
+        : [];
 
-        if (!response.ok) {
-          const message =
-            typeof payload?.detail === "string"
-              ? payload.detail
-              : "Unable to refresh this strategy.";
-          throw new Error(message);
-        }
+      const nextStates: Record<string, RefreshState> = {};
+      let firstError = "";
 
-        setRefreshStates((current) => ({
-          ...current,
-          [strategy.strategy_id]: {
+      for (const strategy of openStrategies) {
+        const item = results.find(
+          (result: { strategy_id?: string }) =>
+            result.strategy_id === strategy.strategy_id,
+        );
+
+        if (item?.status === "SUCCESS") {
+          nextStates[strategy.strategy_id] = {
             status: "SUCCESS",
             message: "Updated",
-          },
-        }));
-      } catch (error) {
-        const message =
-          error instanceof Error ? error.message : "Refresh failed.";
-
-        if (!firstError) firstError = message;
-
-        setRefreshStates((current) => ({
-          ...current,
-          [strategy.strategy_id]: { status: "ERROR", message },
-        }));
-      } finally {
-        setRefreshCompleted((current) => current + 1);
+          };
+        } else {
+          const message =
+            item?.message ?? "Strategy was not refreshed.";
+          nextStates[strategy.strategy_id] = {
+            status: "ERROR",
+            message,
+          };
+          if (!firstError) firstError = message;
+        }
       }
-    }
 
-    async function worker() {
-      while (true) {
-        const currentIndex = nextIndex;
-        nextIndex += 1;
-
-        if (currentIndex >= openStrategies.length) return;
-
-        await refreshOne(openStrategies[currentIndex]);
-      }
-    }
-
-    try {
-      await Promise.all(
-        Array.from({ length: concurrency }, () => worker()),
+      setRefreshStates(nextStates);
+      setRefreshCompleted(
+        Number(payload?.strategies_updated ?? 0) +
+          Number(payload?.strategies_failed ?? 0),
       );
 
-      // Snapshot only after all strategy refreshes complete so it captures
-      // one coherent post-refresh portfolio state.
       try {
         await fetch("/api/portfolio/snapshot", { method: "POST" });
       } catch {
-        // Portfolio snapshot is helpful but should never block market refresh.
+        // Portfolio snapshot should never block market refresh.
       }
 
       await loadData(false);
-      setLastPortfolioRefresh(new Date().toISOString());
+      setLastPortfolioRefresh(
+        payload?.refreshed_at ?? new Date().toISOString(),
+      );
 
       if (firstError) setRefreshError(firstError);
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : "Portfolio refresh failed.";
+      setRefreshError(message);
+      setRefreshStates((current) => {
+        const next = { ...current };
+        for (const strategy of openStrategies) {
+          if (next[strategy.strategy_id]?.status === "REFRESHING") {
+            next[strategy.strategy_id] = {
+              status: "ERROR",
+              message,
+            };
+          }
+        }
+        return next;
+      });
     } finally {
       setLastRefreshDurationMs(performance.now() - startedAt);
       setRefreshingAll(false);
     }
   }
 
-  function isMonthOpen(monthKey: string) {
-    return monthOpenState[monthKey] ?? monthKey === currentMonthKey;
-  }
-
   if (loading) {
     return (
-      <main className="min-h-screen bg-gray-50 p-10">
-        <p className="text-gray-600">Loading strategies...</p>
+      <main className="min-h-screen bg-[#f7f7f5] p-10">
+        <p className="text-gray-600">Loading portfolio...</p>
       </main>
     );
   }
 
   return (
-    <main className="min-h-screen bg-gray-50 p-5 text-gray-950 md:p-10">
-      <div className="mx-auto max-w-7xl">
-        <header className="flex flex-col gap-5 border-b border-gray-300 pb-6 lg:flex-row lg:items-end lg:justify-between">
+    <main className="min-h-screen bg-[#f7f7f5] px-5 py-8 text-gray-950 md:px-8 lg:px-10">
+      <div className="mx-auto max-w-[1450px]">
+        <header className="flex flex-col gap-6 lg:flex-row lg:items-end lg:justify-between">
           <div>
-            <p className="text-sm font-semibold uppercase tracking-[0.18em] text-gray-500">
-              Portfolio
+            <p className="text-xs font-bold uppercase tracking-[0.18em] text-gray-400">
+              VOTE Portfolio
             </p>
-            <h1 className="mt-2 text-3xl font-bold">Strategies</h1>
-            <p className="mt-2 text-sm text-gray-600">
-              Refresh the whole portfolio here. Individual strategy pages are for analysis and decisions.
+            <h1 className="mt-2 text-4xl font-semibold tracking-tight">
+              Strategies
+            </h1>
+            <p className="mt-2 max-w-2xl text-sm leading-6 text-gray-500">
+              See portfolio P&amp;L, concentration and the few strategy metrics that matter before deciding where to focus.
             </p>
             {lastPortfolioRefresh && (
-              <p className="mt-2 text-xs text-gray-500">
+              <p className="mt-2 text-xs text-gray-400">
                 Last market refresh: {new Date(lastPortfolioRefresh).toLocaleString("en-IN")}
                 {lastRefreshDurationMs !== null
-                  ? ` · completed in ${(lastRefreshDurationMs / 1000).toFixed(1)}s`
+                  ? ` · ${(lastRefreshDurationMs / 1000).toFixed(1)}s`
                   : ""}
               </p>
             )}
           </div>
 
-          <div className="flex flex-wrap gap-3">
+          <div className="flex flex-wrap gap-2">
+            <a
+              href={ZERODHA_LOGIN_URL}
+              target="_blank"
+              rel="noreferrer"
+              className="rounded-xl border border-blue-200 bg-blue-50 px-4 py-2.5 text-sm font-semibold text-blue-800 transition hover:bg-blue-100"
+            >
+              Connect Zerodha
+            </a>
+
             <button
               type="button"
               onClick={refreshAllMarketData}
-              disabled={refreshingAll}
-              className="min-w-[210px] rounded bg-gray-950 px-5 py-3 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-70"
+              disabled={refreshingAll || openStrategies.length === 0}
+              className="rounded-xl bg-gray-950 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-gray-800 disabled:cursor-not-allowed disabled:opacity-50"
             >
               {refreshingAll
-                ? `Refreshing ${refreshCompleted}/${refreshTotal}...`
-                : "Refresh All Market Data"}
+                ? `Refreshing ${refreshCompleted}/${refreshTotal}`
+                : "Refresh Market Data"}
             </button>
+
             <Link
               href="/strategies/new"
-              className="rounded border border-gray-400 bg-white px-5 py-3 text-sm font-semibold"
+              className="rounded-xl border border-gray-300 bg-white px-4 py-2.5 text-sm font-semibold text-gray-800 transition hover:border-gray-400"
             >
               + New Strategy
             </Link>
@@ -391,15 +660,15 @@ export default function StrategiesPage() {
         </header>
 
         {refreshError && (
-          <div className="mt-5 rounded-lg border border-amber-300 bg-amber-50 p-4">
-            <p className="font-semibold text-amber-950">Portfolio refresh needs attention</p>
-            <p className="mt-1 text-sm text-amber-800">{refreshError}</p>
+          <div className="mt-5 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+            <p className="font-semibold">Portfolio refresh needs attention</p>
+            <p className="mt-1">{refreshError}</p>
             {requiresReconnect(refreshError) && (
               <a
                 href={ZERODHA_LOGIN_URL}
                 target="_blank"
                 rel="noreferrer"
-                className="mt-3 inline-block rounded bg-gray-950 px-4 py-2 text-sm font-semibold text-white"
+                className="mt-3 inline-block rounded-lg bg-gray-950 px-3 py-2 text-xs font-semibold text-white"
               >
                 Reconnect Zerodha
               </a>
@@ -407,170 +676,145 @@ export default function StrategiesPage() {
           </div>
         )}
 
-        {refreshingAll || Object.keys(refreshStates).length > 0 ? (
-          <section className="mt-5 rounded-xl border border-gray-300 bg-white p-5">
-            <div className="flex flex-wrap items-center justify-between gap-3">
-              <p className="text-xs font-semibold uppercase tracking-[0.14em] text-gray-500">
-                Portfolio Refresh
-              </p>
-              <p className="text-xs font-medium text-gray-500">
-                {refreshingAll
-                  ? `${refreshCompleted} of ${refreshTotal} completed · up to 3 refreshing in parallel`
-                  : `${Object.values(refreshStates).filter((state) => state.status === "SUCCESS").length} updated · ${Object.values(refreshStates).filter((state) => state.status === "ERROR").length} failed`}
-              </p>
-            </div>
-            {refreshingAll && refreshTotal > 0 && (
-              <div className="mt-3 h-2 overflow-hidden rounded-full bg-gray-100">
-                <div
-                  className="h-full rounded-full bg-gray-950 transition-all duration-300"
-                  style={{
-                    width: `${Math.min(100, (refreshCompleted / refreshTotal) * 100)}%`,
-                  }}
-                />
-              </div>
-            )}
-            <div className="mt-3 grid gap-2 md:grid-cols-2 xl:grid-cols-3">
-              {strategies
-                .filter((strategy) => refreshStates[strategy.strategy_id])
-                .map((strategy) => {
-                  const state = refreshStates[strategy.strategy_id];
-                  return (
-                    <div
-                      key={strategy.strategy_id}
-                      className="flex items-center justify-between rounded border border-gray-200 px-3 py-2 text-sm"
-                    >
-                      <span className="font-medium">{strategy.symbol}</span>
-                      <span
-                        className={
-                          state.status === "SUCCESS"
-                            ? "text-emerald-700"
-                            : state.status === "ERROR"
-                              ? "text-red-700"
-                              : "text-gray-500"
-                        }
-                      >
-                        {state.status === "SUCCESS"
-                          ? "✓ Updated"
-                          : state.status === "ERROR"
-                            ? "⚠ Failed"
-                            : state.status === "REFRESHING"
-                              ? "Refreshing..."
-                              : "Waiting"}
-                      </span>
-                    </div>
-                  );
-                })}
-            </div>
-          </section>
-        ) : null}
-
         {errorMessage && (
-          <div className="mt-5 rounded border border-red-300 bg-red-50 p-4 text-red-800">
+          <div className="mt-5 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800">
             {errorMessage}
           </div>
         )}
 
-        <section className="mt-7 space-y-5 pb-12">
-          {monthGroups.map((group) => {
-            const monthOpen = isMonthOpen(group.monthKey);
-            const closedOpen = closedOpenState[group.monthKey] ?? false;
-
-            return (
-              <article
-                key={group.monthKey}
-                className="overflow-hidden rounded-xl border border-gray-300 bg-white shadow-sm"
-              >
-                <button
-                  type="button"
-                  onClick={() =>
-                    setMonthOpenState((current) => ({
-                      ...current,
-                      [group.monthKey]: !monthOpen,
-                    }))
-                  }
-                  className="w-full px-5 py-5 text-left"
-                >
-                  <div className="flex flex-col gap-5 lg:flex-row lg:items-center lg:justify-between">
-                    <div className="flex items-center gap-3">
-                      <span className="text-xl text-gray-500">{monthOpen ? "▾" : "▸"}</span>
-                      <div>
-                        <h2 className="text-xl font-bold">{group.monthLabel}</h2>
-                        <p className="mt-1 text-sm text-gray-500">
-                          {group.active.length} active · {group.closed.length} closed
-                        </p>
-                      </div>
-                    </div>
-
-                    <div className="grid grid-cols-2 gap-5 sm:grid-cols-4 lg:min-w-[680px]">
-                      <div>
-                        <p className="text-xs font-semibold uppercase tracking-wide text-gray-500">Total Realised</p>
-                        <p className={`mt-1 font-semibold ${pnlClass(group.realised)}`}>
-                          {formatCurrency(group.realised)}
-                        </p>
-                      </div>
-                      <div>
-                        <p className="text-xs font-semibold uppercase tracking-wide text-gray-500">Total Unrealised</p>
-                        <p className={`mt-1 font-semibold ${pnlClass(group.unrealised)}`}>
-                          {formatCurrency(group.unrealised)}
-                        </p>
-                      </div>
-                      <div>
-                        <p className="text-xs font-semibold uppercase tracking-wide text-gray-500">Net P&amp;L</p>
-                        <p className={`mt-1 font-semibold ${pnlClass(group.net)}`}>
-                          {formatCurrency(group.net)}
-                        </p>
-                      </div>
-                      <div>
-                        <p className="text-xs font-semibold uppercase tracking-wide text-gray-500">Capital Deployed</p>
-                        <p className="mt-1 font-semibold">
-                          {formatCurrency(group.margin, false)}
-                        </p>
-                      </div>
-                    </div>
-                  </div>
-                </button>
-
-                {monthOpen && (
-                  <div className="border-t border-gray-300">
-                    <div className="bg-gray-50 px-5 py-3">
-                      <h3 className="font-semibold">Active Strategies</h3>
-                    </div>
-                    {group.active.length === 0 ? (
-                      <p className="border-t border-gray-200 px-5 py-5 text-sm text-gray-500">
-                        No active strategies.
-                      </p>
-                    ) : (
-                      group.active.map((strategy) => (
-                        <StrategyRow key={strategy.strategy_id} strategy={strategy} />
-                      ))
-                    )}
-
-                    <button
-                      type="button"
-                      onClick={() =>
-                        setClosedOpenState((current) => ({
-                          ...current,
-                          [group.monthKey]: !closedOpen,
-                        }))
-                      }
-                      className="flex w-full items-center justify-between border-t border-gray-300 bg-gray-50 px-5 py-3 text-left"
-                    >
-                      <span className="font-semibold">
-                        {closedOpen ? "▾" : "▸"} Closed Strategies
-                      </span>
-                      <span className="text-sm text-gray-500">{group.closed.length}</span>
-                    </button>
-
-                    {closedOpen &&
-                      group.closed.map((strategy) => (
-                        <StrategyRow key={strategy.strategy_id} strategy={strategy} />
-                      ))}
-                  </div>
-                )}
-              </article>
-            );
-          })}
+        <section className="mt-7 rounded-2xl border border-gray-200 bg-white px-5 py-5 shadow-sm md:px-6">
+          <div className="grid gap-5 sm:grid-cols-2 lg:grid-cols-5">
+            <PortfolioMetric
+              label="Current MTM"
+              value={formatCompactCurrency(currentPortfolioMtm)}
+              valueClassName={pnlClass(currentPortfolioMtm)}
+            />
+            <PortfolioMetric
+              label="Realised this month"
+              value={formatCompactCurrency(realisedThisMonth)}
+              valueClassName={pnlClass(realisedThisMonth)}
+              subtext="By actual closure date"
+            />
+            <PortfolioMetric
+              label="Capital deployed"
+              value={formatCompactCurrency(totalCapitalDeployed)}
+              subtext="All open strategies"
+            />
+            <PortfolioMetric
+              label="Portfolio Theta"
+              value={`${formatCompactCurrency(portfolioTheta)} / day`}
+              subtext="Model estimate"
+            />
+            <PortfolioMetric
+              label="Open strategies"
+              value={String(openStrategies.length)}
+              subtext="Across all expiry months"
+            />
+          </div>
         </section>
+
+        {refreshingAll && (
+          <section className="mt-4 rounded-xl border border-gray-200 bg-white px-4 py-3">
+            <div className="flex items-center justify-between gap-4 text-xs text-gray-500">
+              <span>
+                Updating portfolio · {refreshCompleted} of {refreshTotal}
+              </span>
+              <span>Up to 3 strategies in parallel</span>
+            </div>
+            <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-gray-100">
+              <div
+                className="h-full rounded-full bg-gray-950 transition-all duration-300"
+                style={{
+                  width: `${
+                    refreshTotal > 0
+                      ? Math.min(100, (refreshCompleted / refreshTotal) * 100)
+                      : 0
+                  }%`,
+                }}
+              />
+            </div>
+          </section>
+        )}
+
+        <section className="mt-8">
+          <div className="flex flex-wrap items-end justify-between gap-3">
+            <div>
+              <p className="text-xs font-bold uppercase tracking-[0.16em] text-gray-400">
+                Current portfolio
+              </p>
+              <h2 className="mt-1 text-2xl font-semibold">Open strategies</h2>
+            </div>
+            <p className="text-xs text-gray-500">
+              Concentration = strategy margin ÷ total margin deployed · policy cap {CONCENTRATION_LIMIT_PCT}%
+            </p>
+          </div>
+
+          {sortedOpenStrategies.length === 0 ? (
+            <div className="mt-4 rounded-2xl border border-dashed border-gray-300 bg-white px-6 py-10 text-center text-sm text-gray-500">
+              No open strategies.
+            </div>
+          ) : (
+            <div className="mt-4 grid gap-4 md:grid-cols-2 xl:grid-cols-3">
+              {sortedOpenStrategies.map((strategy) => {
+                const history = snapshotsByStrategy.get(strategy.strategy_id) ?? [];
+                const latestSnapshot = history[0] ?? null;
+                const previousSnapshot = history[1] ?? null;
+                const concentrationPct =
+                  totalCapitalDeployed > 0
+                    ? (Number(strategy.margin_used ?? 0) / totalCapitalDeployed) * 100
+                    : 0;
+
+                return (
+                  <StrategyCard
+                    key={strategy.strategy_id}
+                    strategy={strategy}
+                    concentrationPct={concentrationPct}
+                    latestSnapshot={latestSnapshot}
+                    previousSnapshot={previousSnapshot}
+                  />
+                );
+              })}
+            </div>
+          )}
+        </section>
+
+        {closedStrategies.length > 0 && (
+          <details className="mt-8 rounded-2xl border border-gray-200 bg-white shadow-sm">
+            <summary className="cursor-pointer px-5 py-4 text-sm font-semibold text-gray-700">
+              Closed strategies ({closedStrategies.length})
+            </summary>
+            <div className="border-t border-gray-200">
+              {closedStrategies.map((strategy) => (
+                <Link
+                  key={strategy.strategy_id}
+                  href={`/strategies/${encodeURIComponent(strategy.strategy_id)}`}
+                  className="flex flex-col gap-2 border-t border-gray-100 px-5 py-4 first:border-t-0 sm:flex-row sm:items-center sm:justify-between"
+                >
+                  <div>
+                    <p className="font-semibold text-gray-900">
+                      {strategy.symbol} · {strategy.strategy_name}
+                    </p>
+                    <p className="mt-1 text-xs text-gray-500">
+                      Expiry {formatExpiryMonth(strategy.expiry_month)}
+                    </p>
+                  </div>
+                  <div className="text-sm">
+                    <span className="text-gray-500">Final P&amp;L </span>
+                    <span className={`font-semibold ${pnlClass(strategy.total_pnl)}`}>
+                      {formatCurrency(strategy.total_pnl)}
+                    </span>
+                  </div>
+                </Link>
+              ))}
+            </div>
+          </details>
+        )}
+
+        {Object.keys(refreshStates).length > 0 && !refreshingAll && (
+          <div className="mt-5 text-xs text-gray-400">
+            {Object.values(refreshStates).filter((state) => state.status === "SUCCESS").length} updated · {Object.values(refreshStates).filter((state) => state.status === "ERROR").length} failed
+          </div>
+        )}
       </div>
     </main>
   );
