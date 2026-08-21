@@ -1339,6 +1339,107 @@ def refresh_strategy(request: RefreshStrategyRequest) -> dict[str, Any]:
             .execute()
         )
 
+        # Persist one strategy-level market/risk snapshot per calendar day.
+        # Repeated portfolio or individual refreshes on the same day update the
+        # same row. This makes the portfolio-level Refresh Market Data button the
+        # canonical way to build the day-wise history.
+        daily_snapshot_status = "SAVED"
+        try:
+            snapshot_date = datetime.now(IST).date().isoformat()
+
+            nearest_dte = None
+            today_date = datetime.now(IST).date()
+            dte_values: list[int] = []
+            for open_position in open_positions:
+                expiry_value = open_position.get("expiry_date")
+                if not expiry_value:
+                    continue
+                try:
+                    expiry_date_value = datetime.fromisoformat(str(expiry_value)[:10]).date()
+                    dte_values.append(max(0, (expiry_date_value - today_date).days))
+                except (TypeError, ValueError):
+                    continue
+            if dte_values:
+                nearest_dte = min(dte_values)
+
+            realistic_max_profit = None
+            profit_snapshot_response = (
+                database.table("strategy_profit_snapshots")
+                .select("realistic_max_profit_after,captured_at")
+                .eq("strategy_id", request.strategy_id)
+                .order("captured_at", desc=True)
+                .limit(1)
+                .execute()
+            )
+            if profit_snapshot_response.data:
+                candidate = profit_snapshot_response.data[0].get("realistic_max_profit_after")
+                if candidate is not None:
+                    realistic_max_profit = float(candidate)
+
+            if realistic_max_profit is None:
+                prior_daily_response = (
+                    database.table("strategy_daily_snapshots")
+                    .select("realistic_max_profit")
+                    .eq("strategy_id", request.strategy_id)
+                    .order("snapshot_date", desc=True)
+                    .limit(10)
+                    .execute()
+                )
+                for prior_row in prior_daily_response.data or []:
+                    candidate = prior_row.get("realistic_max_profit")
+                    if candidate is not None:
+                        realistic_max_profit = float(candidate)
+                        break
+
+            capture_pct = None
+            if realistic_max_profit is not None and realistic_max_profit > 0:
+                capture_pct = max(0.0, (float(total_unrealised_mtm) / realistic_max_profit) * 100.0)
+
+            margin_used_value = float(strategy.get("margin_used") or 0)
+            theta_efficiency = (
+                round(float(strategy_theta) / (margin_used_value / 100000.0), 4)
+                if margin_used_value > 0
+                else None
+            )
+
+            daily_payload = {
+                "strategy_id": request.strategy_id,
+                "snapshot_date": snapshot_date,
+                "captured_at": refreshed_at,
+                "current_spot_price": current_spot_price,
+                "unrealised_mtm": total_unrealised_mtm,
+                "realised_pnl": round(realised_pnl, 2),
+                "total_pnl": total_pnl,
+                "realistic_max_profit": realistic_max_profit,
+                "unrealised_capture_pct": capture_pct,
+                "margin_used": strategy.get("margin_used"),
+                "nearest_dte": nearest_dte,
+                "strategy_delta": strategy_delta,
+                "strategy_gamma": strategy_gamma,
+                "strategy_theta": strategy_theta,
+                "strategy_vega": strategy_vega,
+                "weighted_iv": weighted_iv,
+                "futures_lot_size": futures_lot_size or None,
+                "delta_lot_equivalent": delta_lot_equivalent,
+                "futures_delta_lots": futures_delta_lots,
+                "options_delta_lots": options_delta_lots,
+                "net_future_contract_lots": net_future_contract_lots,
+                "has_futures": has_futures,
+                "delta_up_1pct_lots": delta_up_1pct_lots,
+                "delta_down_1pct_lots": delta_down_1pct_lots,
+                "pnl_up_1pct": pnl_up_1pct,
+                "pnl_down_1pct": pnl_down_1pct,
+                "theta_efficiency_per_lakh": theta_efficiency,
+            }
+
+            (
+                database.table("strategy_daily_snapshots")
+                .upsert(daily_payload, on_conflict="strategy_id,snapshot_date")
+                .execute()
+            )
+        except Exception as snapshot_exc:
+            daily_snapshot_status = f"WARNING: {snapshot_exc}"
+
         # Observation capture is also deliberately excluded from the blocking
         # market-price path. It can be run separately after prices are visible.
         return {
@@ -1375,6 +1476,7 @@ def refresh_strategy(request: RefreshStrategyRequest) -> dict[str, Any]:
             "pnl_down_1pct": pnl_down_1pct,
             "greeks_updated_at": refreshed_at,
             "refreshed_at": refreshed_at,
+            "daily_snapshot_status": daily_snapshot_status,
             "positions": position_results,
         }
 

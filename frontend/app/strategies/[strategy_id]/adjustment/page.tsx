@@ -9,7 +9,6 @@ import {
   calculatePayoffMetrics,
   calculateStrategyPayoff,
   type StrategyLeg,
-  type StrategyMetrics,
 } from "@/lib/payoff";
 
 type Strategy = {
@@ -19,6 +18,8 @@ type Strategy = {
   status: string;
   entry_spot_price: number | null;
   expiry_month: string | null;
+  current_spot_price: number | null;
+  market_data_updated_at: string | null;
 };
 
 type CurrentPosition = {
@@ -26,12 +27,21 @@ type CurrentPosition = {
   instrument_type: string | null;
   option_type: string | null;
   strike: number | null;
+  expiry_date: string | null;
   position_side: string | null;
-  open_quantity: number | null;
   quantity: number | null;
-  entry_price: number| null;
+  open_quantity: number | null;
+  closed_quantity: number | null;
+  entry_price: number | null;
+  current_price: number | null;
   contract_multiplier: number | null;
   lot_size: number | null;
+  mtm: number | null;
+  realised_pnl: number | null;
+  status: string | null;
+  exchange: string | null;
+  tradingsymbol: string | null;
+  instrument_token: number | null;
 };
 
 type InstrumentType = "OPTION" | "FUTURE" | "EQUITY";
@@ -48,16 +58,7 @@ type ZerodhaInstrument = {
   exchange: string;
 };
 
-const EXPIRY_MONTH_OPTIONS = Array.from({ length: 12 }, (_, index) => {
-  const date = new Date();
-  date.setDate(1);
-  date.setMonth(date.getMonth() + index);
-  const value = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`;
-  const label = new Intl.DateTimeFormat("en-GB", { month: "short", year: "numeric" }).format(date);
-  return { value, label };
-});
-
-type Leg = {
+type DraftLeg = {
   id: number;
   instrumentType: InstrumentType;
   positionSide: PositionSide;
@@ -73,7 +74,25 @@ type Leg = {
   lotSize: number | null;
 };
 
-function createLeg(id: number): Leg {
+type ClosePlan = {
+  positionId: number;
+  quantityToClose: number;
+  price: string;
+};
+
+const EXPIRY_MONTH_OPTIONS = Array.from({ length: 12 }, (_, index) => {
+  const date = new Date();
+  date.setDate(1);
+  date.setMonth(date.getMonth() + index);
+  const value = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`;
+  const label = new Intl.DateTimeFormat("en-GB", {
+    month: "short",
+    year: "numeric",
+  }).format(date);
+  return { value, label };
+});
+
+function createLeg(id: number): DraftLeg {
   return {
     id,
     instrumentType: "OPTION",
@@ -91,176 +110,135 @@ function createLeg(id: number): Leg {
   };
 }
 
-
-function calculateNetCredit(legs: StrategyLeg[]) {
-  return legs.reduce((total, leg) => {
-    if (leg.instrumentType === "FUTURE") {
-      return total;
-    }
-
-    const value = leg.premium * leg.quantity * leg.lotSize;
-    return total + (leg.side === "SELL" ? value : -value);
-  }, 0);
+function formatNumber(value: number | null | undefined) {
+  if (value === null || value === undefined || !Number.isFinite(Number(value))) return "—";
+  return Number(value).toLocaleString("en-IN", { maximumFractionDigits: 2 });
 }
 
-function formatComparisonCurrency(value: number | null) {
-  if (value === null || !Number.isFinite(value)) {
-    return "—";
-  }
-
-  const sign = value > 0 ? "+" : value < 0 ? "-" : "";
-  return `${sign}₹${Math.abs(value).toLocaleString("en-IN", {
-    maximumFractionDigits: 0,
-  })}`;
+function formatCurrency(value: number | null | undefined) {
+  if (value === null || value === undefined || !Number.isFinite(Number(value))) return "—";
+  return `₹${Number(value).toLocaleString("en-IN", { maximumFractionDigits: 2 })}`;
 }
 
-function formatComparisonNumber(value: number | null) {
-  if (value === null || !Number.isFinite(value)) {
-    return "—";
+function describePosition(position: CurrentPosition) {
+  if (position.instrument_type === "OPTION") {
+    return `${position.position_side ?? ""} ${formatNumber(position.strike)} ${position.option_type ?? ""}`.trim();
   }
-
-  return value.toLocaleString("en-IN", {
-    maximumFractionDigits: 2,
-  });
+  return `${position.position_side ?? ""} ${position.instrument_type ?? ""}`.trim();
 }
 
-function metricDifference(
-  current: number | null,
-  preview: number | null,
-) {
-  if (current === null || preview === null) {
-    return null;
+function calculateClosurePnl(position: CurrentPosition, closingQuantity: number, closingPrice: number) {
+  const multiplier = Number(position.contract_multiplier ?? 1);
+  const entryPrice = Number(position.entry_price ?? 0);
+  if (position.position_side === "SELL") {
+    return (entryPrice - closingPrice) * closingQuantity * multiplier;
   }
-
-  return preview - current;
+  return (closingPrice - entryPrice) * closingQuantity * multiplier;
 }
 
-type ComparisonRow = {
-  label: string;
-  current: number | null;
-  preview: number | null;
-  difference: number | null;
-  format: "currency" | "number";
-  impact: string;
-  impactTone: "positive" | "negative" | "neutral";
-};
+function positionToPayoffLeg(position: CurrentPosition, quantity: number): StrategyLeg[] {
+  const side = position.position_side;
+  if ((side !== "BUY" && side !== "SELL") || quantity <= 0) return [];
 
-function buildImpact(
-  label: string,
-  current: number | null,
-  preview: number | null,
-): Pick<ComparisonRow, "impact" | "impactTone"> {
-  if (current === null || preview === null) {
-    return { impact: "Not available", impactTone: "neutral" };
+  const multiplier = Number(position.contract_multiplier ?? 1);
+  if (!Number.isFinite(multiplier) || multiplier <= 0) return [];
+
+  if (
+    position.instrument_type === "OPTION" &&
+    (position.option_type === "CE" || position.option_type === "PE") &&
+    Number.isFinite(Number(position.strike)) &&
+    Number(position.strike) > 0
+  ) {
+    return [{
+      instrumentType: "OPTION",
+      side,
+      optionType: position.option_type,
+      strike: Number(position.strike),
+      premium: Number(position.entry_price ?? 0),
+      quantity,
+      lotSize: multiplier,
+    }];
   }
 
-  const change = preview - current;
-  const tolerance = 0.0001;
-
-  if (Math.abs(change) < tolerance) {
-    return { impact: "No material change", impactTone: "neutral" };
+  if (position.instrument_type === "FUTURE" && Number(position.entry_price) > 0) {
+    return [{
+      instrumentType: "FUTURE",
+      side,
+      entryPrice: Number(position.entry_price),
+      quantity,
+      lotSize: multiplier,
+    }];
   }
 
-  if (label === "Max Loss") {
-    return change > 0
-      ? { impact: "Downside improved", impactTone: "positive" }
-      : { impact: "Downside increased", impactTone: "negative" };
-  }
-
-  if (label === "Lower Breakeven") {
-    return change < 0
-      ? { impact: "Lower side widened", impactTone: "positive" }
-      : { impact: "Lower side narrowed", impactTone: "negative" };
-  }
-
-  if (label === "Upper Breakeven") {
-    return change > 0
-      ? { impact: "Upper side widened", impactTone: "positive" }
-      : { impact: "Upper side narrowed", impactTone: "negative" };
-  }
-
-  return change > 0
-    ? { impact: "Improved", impactTone: "positive" }
-    : { impact: "Reduced", impactTone: "negative" };
+  return [];
 }
 
 export default function AddAdjustmentPage() {
   const params = useParams<{ strategy_id: string }>();
   const router = useRouter();
-
   const strategyId = decodeURIComponent(params.strategy_id);
 
   const [strategy, setStrategy] = useState<Strategy | null>(null);
-  const [currentPositions, setCurrentPositions] = useState<
-    CurrentPosition[]
-  >([]);
+  const [currentPositions, setCurrentPositions] = useState<CurrentPosition[]>([]);
   const [loading, setLoading] = useState(true);
+  const [refreshingPrices, setRefreshingPrices] = useState(false);
+  const [priceMessage, setPriceMessage] = useState("");
+  const [liveSpot, setLiveSpot] = useState<number | null>(null);
+  const [liveSpotUpdatedAt, setLiveSpotUpdatedAt] = useState<string | null>(null);
 
-  const [adjustmentDate, setAdjustmentDate] = useState(
-    new Date().toISOString().slice(0, 10),
-  );
-
+  const [adjustmentDate, setAdjustmentDate] = useState(new Date().toISOString().slice(0, 10));
   const [underlyingSpot, setUnderlyingSpot] = useState("");
   const [reason, setReason] = useState("");
   const [notes, setNotes] = useState("");
 
-  const [legs, setLegs] = useState<Leg[]>([
-    createLeg(1),
-    createLeg(2),
-  ]);
-
+  const [legs, setLegs] = useState<DraftLeg[]>([createLeg(1)]);
+  const [closePlans, setClosePlans] = useState<Record<number, ClosePlan>>({});
   const [draftConfirmed, setDraftConfirmed] = useState(false);
-  const [confirmedDraftLegs, setConfirmedDraftLegs] =
-    useState<StrategyLeg[]>([]);
-
   const [saving, setSaving] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
   const [draftErrorMessage, setDraftErrorMessage] = useState("");
+
   const [contracts, setContracts] = useState<ZerodhaInstrument[]>([]);
   const [loadingContracts, setLoadingContracts] = useState(false);
   const [contractError, setContractError] = useState("");
 
+  async function loadOpenPositions() {
+    const { data, error } = await supabase
+      .from("book_positions")
+      .select(
+        "id,instrument_type,option_type,strike,expiry_date,position_side,quantity,open_quantity,closed_quantity,entry_price,current_price,contract_multiplier,lot_size,mtm,realised_pnl,status,exchange,tradingsymbol,instrument_token",
+      )
+      .eq("strategy_id", strategyId)
+      .gt("open_quantity", 0);
+
+    if (error) throw new Error(error.message);
+    setCurrentPositions((data ?? []) as CurrentPosition[]);
+  }
+
   useEffect(() => {
     async function loadStrategy() {
       setLoading(true);
-
-      const { data, error } = await supabase
-        .from("strategy_master")
-        .select(
-          "strategy_id, strategy_name, symbol, status, entry_spot_price, expiry_month",
-        )
-        .eq("strategy_id", strategyId)
-        .single();
-
-      if (error) {
-        setErrorMessage(error.message);
-        setLoading(false);
-        return;
-      }
-
-  setStrategy(data);
-
-      const { data: positions, error: positionsError } =
-        await supabase
-          .from("book_positions")
-          .select(
-            "id, instrument_type, option_type, strike, position_side, open_quantity, quantity, entry_price, contract_multiplier, lot_size",
-          )
+      try {
+        const { data, error } = await supabase
+          .from("strategy_master")
+          .select("strategy_id,strategy_name,symbol,status,entry_spot_price,expiry_month,current_spot_price,market_data_updated_at")
           .eq("strategy_id", strategyId)
-          .eq("status", "OPEN")
-          .gt("open_quantity", 0);
+          .single();
 
-      if (positionsError) {
-setErrorMessage(positionsError.message);
+        if (error || !data) throw new Error(error?.message ?? "Strategy not found.");
+        setStrategy(data);
+        if (Number(data.current_spot_price) > 0) {
+          setLiveSpot(Number(data.current_spot_price));
+          setLiveSpotUpdatedAt(data.market_data_updated_at ?? null);
+        }
+        await loadOpenPositions();
+      } catch (error) {
+        setErrorMessage(error instanceof Error ? error.message : "Unable to load strategy.");
+      } finally {
         setLoading(false);
-        return;
       }
-
-      setCurrentPositions(positions ?? []);
-      setLoading(false);
     }
-
-    loadStrategy();
+    void loadStrategy();
   }, [strategyId]);
 
   useEffect(() => {
@@ -273,10 +251,10 @@ setErrorMessage(positionsError.message);
           `/api/market/instruments?exchange=NFO&underlying=${encodeURIComponent(strategy.symbol)}&limit=1000`,
           { cache: "no-store" },
         );
-        const payload = await response.json();
-        if (!response.ok) {
-          throw new Error(typeof payload?.detail === "string" ? payload.detail : "Unable to load Zerodha contracts.");
-        }
+        const text = await response.text();
+        let payload: any = {};
+        try { payload = text ? JSON.parse(text) : {}; } catch { payload = { detail: text }; }
+        if (!response.ok) throw new Error(typeof payload?.detail === "string" ? payload.detail : "Unable to load Zerodha contracts.");
         setContracts(payload.instruments ?? []);
       } catch (error) {
         setContractError(error instanceof Error ? error.message : "Unable to load contracts.");
@@ -288,271 +266,71 @@ setErrorMessage(positionsError.message);
     void loadContracts();
   }, [strategy?.symbol]);
 
-  const currentStrategyLegs = useMemo<StrategyLeg[]>(() => {
-    return currentPositions.flatMap((position) => {
-      const side = position.position_side;
-      const quantity = Number(
-        position.open_quantity ?? position.quantity ?? 0,
- );
-      const lotSize = Number(
-        position.contract_multiplier ?? position.lot_size ?? 1,
-      );
-
-      if (
-        (side !== "BUY" && side!== "SELL") ||
-        !Number.isFinite(quantity) ||
-        quantity <= 0 ||
-        !Number.isFinite(lotSize) ||
-        lotSize <= 0
-      ) {
-   return [];
+  async function refreshExistingPrices() {
+    if (!strategy || refreshingPrices) return;
+    setRefreshingPrices(true);
+    setPriceMessage("");
+    setErrorMessage("");
+    try {
+      const response = await fetch("/api/market/refresh-strategy", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ strategy_id: strategy.strategy_id }),
+      });
+      const text = await response.text();
+      let payload: any = {};
+      try { payload = text ? JSON.parse(text) : {}; } catch { payload = { detail: text }; }
+      if (!response.ok) {
+        const detail = typeof payload?.detail === "string" ? payload.detail : JSON.stringify(payload?.detail ?? payload);
+        throw new Error(detail || "Unable to refresh market prices.");
       }
+      if (Number(payload.current_spot_price) > 0) {
+        setLiveSpot(Number(payload.current_spot_price));
+        setLiveSpotUpdatedAt(payload.refreshed_at ?? new Date().toISOString());
+      } else {
+        const { data: refreshedStrategy } = await supabase
+          .from("strategy_master")
+          .select("current_spot_price,market_data_updated_at")
+          .eq("strategy_id", strategy.strategy_id)
+          .single();
 
-      if (
-        position.instrument_type === "OPTION" &&
-        (position.option_type === "CE" ||
-          position.option_type === "PE") &&
-        Number.isFinite(position.strike) &&
-        Number(position.strike) > 0
-      ) {
-        return [
-          {
-instrumentType: "OPTION" as const,
-            side,
-            optionType: position.option_type,
-            strike: Number(position.strike),
-   premium: Number(position.entry_price ?? 0),
-            quantity,
-            lotSize,
-          },
-        ];
-      }
-
-      if (
-        position.instrument_type === "FUTURE" &&
-        Number.isFinite(position.entry_price) &&
-        Number(position.entry_price) > 0
-      ) {
-        return [
-       {
-            instrumentType: "FUTURE" as const,
-            side,
-            entryPrice: Number(position.entry_price),
-            quantity,
-          lotSize,
-          },
-        ];
-      }
-
-      return [];
-    });
-  }, [currentPositions]);
-
-  const draftStrategyLegs = useMemo<StrategyLeg[]>(() => {
-    return legs.flatMap((leg) => {
-      const quantity = Number(leg.quantity);
-      const entryPrice = Number(leg.entryPrice);
-
-      if (
-        !Number.isFinite(quantity) ||
-        quantity <= 0 ||
-        !Number.isFinite(entryPrice) ||
-        entryPrice < 0
-      ) {
-        return [];
-      }
-
-      if (leg.instrumentType === "OPTION") {
-        const strike = Number(leg.strike);
-
-        if (
-          (leg.optionType !== "CE"&& leg.optionType !== "PE") ||
-          !Number.isFinite(strike) ||
-          strike <= 0
-        ) {
-          return [];
+        if (Number(refreshedStrategy?.current_spot_price) > 0) {
+          setLiveSpot(Number(refreshedStrategy.current_spot_price));
+          setLiveSpotUpdatedAt(refreshedStrategy.market_data_updated_at ?? new Date().toISOString());
         }
-
-        return[
-          {
-            instrumentType: "OPTION" as const,
-            side: leg.positionSide,
-            optionType: leg.optionType,
-            strike,
-            premium: entryPrice,
-            quantity,
-            lotSize: 1,
-          },
-        ];
       }
-
-      if (
-        leg.instrumentType === "FUTURE" &&
-        entryPrice > 0
-      ) {
-        return [
-          {
-            instrumentType: "FUTURE" as const,
-            side: leg.positionSide,
-            entryPrice,
-            quantity,
-            lotSize: 1,
-          },
-        ];
-      }
-
-      return [];
-    });
-  }, [legs]);
-
-  const previewStrategyLegs = useMemo<StrategyLeg[]>(() => {
-    const activeDraftLegs = draftConfirmed
-      ? confirmedDraftLegs
-      : draftStrategyLegs;
-
-    return [...currentStrategyLegs, ...activeDraftLegs];
-  }, [
-    currentStrategyLegs,
-    draftConfirmed,
-    confirmedDraftLegs,
-    draftStrategyLegs,
-  ]);
-
-  const chartSpot = useMemo(() => {
-    const enteredSpot = Number(underlyingSpot);
-
-    if (
-      underlyingSpot !== "" &&
-    Number.isFinite(enteredSpot) &&
-      enteredSpot > 0
-    ) {
-      return enteredSpot;
+      await loadOpenPositions();
+      setClosePlans((plans) => {
+        const next = { ...plans };
+        for (const position of currentPositions) {
+          if (next[position.id] && position.current_price !== null) {
+            next[position.id] = { ...next[position.id], price: String(position.current_price) };
+          }
+        }
+        return next;
+      });
+      setPriceMessage("Live Zerodha prices refreshed.");
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : "Unable to refresh prices.");
+    } finally {
+      setRefreshingPrices(false);
     }
+  }
 
-    return strategy?.entry_spot_price ?? null;
-  }, [underlyingSpot, strategy?.entry_spot_price]);
-
-
-  const currentPayoffPoints = useMemo(
-    () =>
-      calculateStrategyPayoff(
-        currentStrategyLegs,
-        chartSpot,
-        20,
-        401,
-      ),
-    [currentStrategyLegs, chartSpot],
-  );
-
-  const previewPayoffPoints = useMemo(
-    () =>
-      previewStrategyLegs.length > 0
-        ? calculateStrategyPayoff(
-            previewStrategyLegs,
-            chartSpot,
-            20,
-            401,
-          )
-        : [],
-    [previewStrategyLegs, chartSpot],
-  );
-
-  const currentMetrics = useMemo<StrategyMetrics>(
-    () => calculatePayoffMetrics(currentPayoffPoints, chartSpot),
-    [currentPayoffPoints, chartSpot],
-  );
-
-  const previewMetrics = useMemo<StrategyMetrics | null>(
-    () =>
-      previewPayoffPoints.length > 0
-        ? calculatePayoffMetrics(previewPayoffPoints, chartSpot)
-        : null,
-    [previewPayoffPoints, chartSpot],
-  );
-
-  const currentNetCredit = useMemo(
-    () => calculateNetCredit(currentStrategyLegs),
-    [currentStrategyLegs],
-  );
-
-  const previewNetCredit = useMemo(
-    () =>
-      previewStrategyLegs.length > 0
-        ? calculateNetCredit(previewStrategyLegs)
-        : null,
-    [previewStrategyLegs],
-  );
-
-  const comparisonRows = useMemo<ComparisonRow[]>(() => {
-    const definitions = [
-      {
-        label: "Net Credit",
-        current: currentNetCredit,
-        preview: previewNetCredit,
-        format: "currency" as const,
-      },
-      {
-        label: "Max Profit",
-        current: currentMetrics.maxProfit,
-        preview: previewMetrics?.maxProfit ?? null,
-        format: "currency" as const,
-      },
-      {
-        label: "Max Loss",
-        current: currentMetrics.maxLoss,
-        preview: previewMetrics?.maxLoss ?? null,
-        format: "currency" as const,
-      },
-      {
-        label: "Payoff at Spot",
-        current: currentMetrics.payoffAtCurrentSpot,
-        preview: previewMetrics?.payoffAtCurrentSpot ?? null,
-  format: "currency" as const,
-      },
-      {
-        label: "Lower Breakeven",
-        current: currentMetrics.lowerBreakeven,
-        preview: previewMetrics?.lowerBreakeven ?? null,
-        format: "number" as const,
-      },
-      {
-        label: "Upper Breakeven",
-        current: currentMetrics.upperBreakeven,
-        preview: previewMetrics?.upperBreakeven ?? null,
-        format: "number" as const,
-      },
-    ];
-
-    return definitions.map((definition) => {
-      const impact = buildImpact(
-        definition.label,
-        definition.current,
-        definition.preview,
-      );
-
-    return {
-        ...definition,
-        difference: metricDifference(
-          definition.current,
-          definition.preview,
-        ),
-...impact,
-      };
-    });
-  }, [
-    currentMetrics,
-    previewMetrics,
-    currentNetCredit,
-    previewNetCredit,
-  ]);
+  useEffect(() => {
+    if (strategy?.status === "OPEN" && currentPositions.length > 0) {
+      void refreshExistingPrices();
+    }
+    // Run once after the strategy/open positions are initially available.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [strategy?.strategy_id]);
 
   function resetDraftConfirmation() {
     setDraftConfirmed(false);
-    setConfirmedDraftLegs([]);
     setDraftErrorMessage("");
   }
 
-  function resolveDerivativeLeg(leg: Leg): Leg {
+  function resolveDerivativeLeg(leg: DraftLeg): DraftLeg {
     if (leg.instrumentType === "EQUITY") return leg;
     if (!leg.expiryMonth || contracts.length === 0) {
       return { ...leg, expiryDate: "", quantity: "", instrumentToken: null, tradingsymbol: null, lotSize: null };
@@ -566,6 +344,7 @@ instrumentType: "OPTION" as const,
           Number(leg.strike) > 0 &&
           Math.abs(Number(item.strike) - Number(leg.strike)) < 0.0001),
     );
+
     candidates = candidates
       .filter((item) => item.expiry)
       .sort((a, b) => String(b.expiry).localeCompare(String(a.expiry)));
@@ -574,6 +353,7 @@ instrumentType: "OPTION" as const,
     if (!instrument) {
       return { ...leg, expiryDate: "", quantity: "", instrumentToken: null, tradingsymbol: null, lotSize: null };
     }
+
     const lots = Math.max(1, Number(leg.lots || 1));
     const lotSize = Number(instrument.lot_size || 1);
     return {
@@ -586,338 +366,460 @@ instrumentType: "OPTION" as const,
     };
   }
 
-  function updateLeg(
-    legId: number,
-    field: keyof Leg,
-    value: string,
-  ) {
+  function updateLeg(legId: number, field: keyof DraftLeg, value: string) {
     resetDraftConfirmation();
-    setLegs((currentLegs) =>
-      currentLegs.map((leg) => {
-        if (leg.id !== legId) return leg;
-        let next = { ...leg, [field]: value };
-        if (field === "instrumentType" && value === "EQUITY") {
-          return { ...next, expiryMonth: "", expiryDate: "", lots: "1", instrumentToken: null, tradingsymbol: null, lotSize: null };
-        }
-        if (["instrumentType", "optionType", "strike", "expiryMonth"].includes(field)) {
-          next = resolveDerivativeLeg({ ...next, instrumentToken: null, tradingsymbol: null, lotSize: null });
-        }
-        return next;
-      }),
-    );
+    setLegs((current) => current.map((leg) => {
+      if (leg.id !== legId) return leg;
+      let next = { ...leg, [field]: value } as DraftLeg;
+      if (field === "instrumentType" && value === "EQUITY") {
+        return { ...next, expiryMonth: "", expiryDate: "", lots: "1", instrumentToken: null, tradingsymbol: null, lotSize: null };
+      }
+      if (["instrumentType", "optionType", "strike", "expiryMonth"].includes(field)) {
+        next = resolveDerivativeLeg({ ...next, instrumentToken: null, tradingsymbol: null, lotSize: null });
+      }
+      return next;
+    }));
   }
 
   function updateLots(legId: number, value: string) {
     resetDraftConfirmation();
-    setLegs((currentLegs) =>
-      currentLegs.map((leg) => {
-        if (leg.id !== legId) return leg;
-        const lots = Math.max(1, Number(value || 1));
-        const lotSize = Number(leg.lotSize || 0);
-        return { ...leg, lots: value, quantity: lotSize > 0 ? String(lots * lotSize) : "" };
-      }),
-    );
+    setLegs((current) => current.map((leg) => {
+      if (leg.id !== legId) return leg;
+      const lots = Math.max(1, Number(value || 1));
+      const lotSize = Number(leg.lotSize || 0);
+      return { ...leg, lots: value, quantity: lotSize > 0 ? String(lots * lotSize) : "" };
+    }));
   }
 
   function addLeg() {
     resetDraftConfirmation();
-
-    const nextId =
-      legs.length === 0
-        ? 1
-        : Math.max(...legs.map((leg) => leg.id)) + 1;
-
-    setLegs((currentLegs) => [
-      ...currentLegs,
-      createLeg(nextId),
-    ]);
+    const nextId = legs.length === 0 ? 1 : Math.max(...legs.map((leg) => leg.id)) + 1;
+    setLegs((current) => [...current, createLeg(nextId)]);
   }
 
   function removeLeg(legId: number) {
     resetDraftConfirmation();
+    setLegs((current) => current.filter((leg) => leg.id !== legId));
+  }
 
-    setLegs((currentLegs) =>
-      currentLegs.filter((leg) => leg.id !== legId),
+  function setCloseQuantity(position: CurrentPosition, quantityToClose: number) {
+    resetDraftConfirmation();
+    const openQuantity = Number(position.open_quantity ?? 0);
+    const safeQuantity = Math.max(0, Math.min(openQuantity, Math.floor(quantityToClose)));
+    if (safeQuantity === 0) {
+      setClosePlans((current) => {
+        const next = { ...current };
+        delete next[position.id];
+        return next;
+      });
+      return;
+    }
+    setClosePlans((current) => ({
+      ...current,
+      [position.id]: {
+        positionId: position.id,
+        quantityToClose: safeQuantity,
+        price: current[position.id]?.price ?? String(position.current_price ?? ""),
+      },
+    }));
+  }
+
+  function setCloseLots(position: CurrentPosition, lots: number) {
+    const lotSize = Number(position.lot_size ?? 0);
+    if (lotSize <= 0) return;
+    setCloseQuantity(position, lots * lotSize);
+  }
+
+  function updateClosePrice(positionId: number, price: string) {
+    resetDraftConfirmation();
+    setClosePlans((current) => current[positionId]
+      ? { ...current, [positionId]: { ...current[positionId], price } }
+      : current,
     );
   }
 
-  function validateDraftForPreview(): string | null {
-    if (legs.length === 0) {
-      return "Add at least one draft leg before generating the preview.";
+  const currentStrategyLegs = useMemo<StrategyLeg[]>(() =>
+    currentPositions.flatMap((position) => positionToPayoffLeg(position, Number(position.open_quantity ?? 0))),
+  [currentPositions]);
+
+  const remainingExistingLegs = useMemo<StrategyLeg[]>(() =>
+    currentPositions.flatMap((position) => {
+      const open = Number(position.open_quantity ?? 0);
+      const close = closePlans[position.id]?.quantityToClose ?? 0;
+      return positionToPayoffLeg(position, Math.max(0, open - close));
+    }),
+  [currentPositions, closePlans]);
+
+  const draftStrategyLegs = useMemo<StrategyLeg[]>(() => legs.flatMap((leg) => {
+    const quantity = Number(leg.quantity);
+    const entryPrice = Number(leg.entryPrice);
+    if (!Number.isFinite(quantity) || quantity <= 0 || !Number.isFinite(entryPrice) || entryPrice < 0) return [];
+
+    if (leg.instrumentType === "OPTION") {
+      const strike = Number(leg.strike);
+      if ((leg.optionType !== "CE" && leg.optionType !== "PE") || !Number.isFinite(strike) || strike <= 0) return [];
+      return [{
+        instrumentType: "OPTION" as const,
+        side: leg.positionSide,
+        optionType: leg.optionType,
+        strike,
+        premium: entryPrice,
+        quantity,
+        lotSize: 1,
+      }];
     }
 
+    if (leg.instrumentType === "FUTURE" && entryPrice > 0) {
+      return [{
+        instrumentType: "FUTURE" as const,
+        side: leg.positionSide,
+        entryPrice,
+        quantity,
+        lotSize: 1,
+      }];
+    }
+    return [];
+  }), [legs]);
+
+  const previewStrategyLegs = useMemo(
+    () => [...remainingExistingLegs, ...draftStrategyLegs],
+    [remainingExistingLegs, draftStrategyLegs],
+  );
+
+  const chartSpot = useMemo(() => {
+    const entered = Number(underlyingSpot);
+    if (underlyingSpot !== "" && Number.isFinite(entered) && entered > 0) return entered;
+    if (liveSpot !== null && Number.isFinite(liveSpot) && liveSpot > 0) return liveSpot;
+    if (strategy?.current_spot_price !== null && Number(strategy?.current_spot_price) > 0) {
+      return Number(strategy.current_spot_price);
+    }
+    return strategy?.entry_spot_price ?? null;
+  }, [underlyingSpot, liveSpot, strategy?.current_spot_price, strategy?.entry_spot_price]);
+
+  const plannedClosures = useMemo(
+    () => Object.values(closePlans).filter((plan) => plan.quantityToClose > 0),
+    [closePlans],
+  );
+
+  const hasNewLegs = draftStrategyLegs.length > 0;
+  const hasChanges = plannedClosures.length > 0 || hasNewLegs;
+
+  const currentExecutionReserve = useMemo(() => {
+    return currentPositions.reduce((total, position) => {
+      if (position.instrument_type !== "OPTION" || position.position_side !== "SELL") return total;
+      const openQuantity = Number(position.open_quantity ?? 0);
+      const lotSize = Number(position.lot_size ?? 0);
+      if (openQuantity <= 0 || lotSize <= 0) return total;
+      return total + (openQuantity / lotSize) * 2000;
+    }, 0);
+  }, [currentPositions]);
+
+  const previewExecutionReserve = useMemo(() => {
+    const remainingReserve = currentPositions.reduce((total, position) => {
+      if (position.instrument_type !== "OPTION" || position.position_side !== "SELL") return total;
+      const openQuantity = Number(position.open_quantity ?? 0);
+      const closingQuantity = closePlans[position.id]?.quantityToClose ?? 0;
+      const remainingQuantity = Math.max(0, openQuantity - closingQuantity);
+      const lotSize = Number(position.lot_size ?? 0);
+      if (remainingQuantity <= 0 || lotSize <= 0) return total;
+      return total + (remainingQuantity / lotSize) * 2000;
+    }, 0);
+    const newReserve = legs.reduce((total, leg) => {
+      if (leg.instrumentType !== "OPTION" || leg.positionSide !== "SELL") return total;
+      const lots = Number(leg.lots ?? 0);
+      return lots > 0 ? total + lots * 2000 : total;
+    }, 0);
+    return remainingReserve + newReserve;
+  }, [currentPositions, closePlans, legs]);
+
+  const currentRealisticMaxProfit = useMemo(() => {
+    const metrics = calculatePayoffMetrics(
+      calculateStrategyPayoff(currentStrategyLegs, chartSpot, 20, 401),
+      chartSpot,
+    );
+    const theoretical = metrics.maxProfit;
+    return theoretical !== null && Number.isFinite(theoretical) && theoretical > 0
+      ? Math.max(0, theoretical - currentExecutionReserve)
+      : null;
+  }, [currentStrategyLegs, chartSpot, currentExecutionReserve]);
+
+  const previewRealisticMaxProfit = useMemo(() => {
+    const metrics = calculatePayoffMetrics(
+      calculateStrategyPayoff(previewStrategyLegs, chartSpot, 20, 401),
+      chartSpot,
+    );
+    const theoretical = metrics.maxProfit;
+    return theoretical !== null && Number.isFinite(theoretical) && theoretical > 0
+      ? Math.max(0, theoretical - previewExecutionReserve)
+      : null;
+  }, [previewStrategyLegs, chartSpot, previewExecutionReserve]);
+
+  function validateNewLegs() {
     for (let index = 0; index < legs.length; index += 1) {
       const leg = legs[index];
-      const legNumber = index + 1;
+      const isBlank = !leg.strike && !leg.expiryMonth && !leg.entryPrice && !leg.tradingsymbol;
+      if (isBlank) continue;
+      const number = index + 1;
       const quantity = Number(leg.quantity);
       const entryPrice = Number(leg.entryPrice);
-
-      if (leg.instrumentType === "EQUITY") {
-        return `Draft leg ${legNumber}: equity payoff preview is not supported yet.`;
-      }
-
-      if (!Number.isInteger(quantity) || quantity <= 0) {
-        return `Draft leg ${legNumber}: quantity must be a positive whole number.`;
+      if (!Number.isInteger(quantity) || quantity <= 0) return `Draft leg ${number}: select a valid Zerodha contract and lots.`;
+      if (leg.entryPrice === "" || !Number.isFinite(entryPrice) || entryPrice < 0) return `Draft leg ${number}: enter a valid entry price.`;
+      if (leg.instrumentType !== "EQUITY" && !leg.expiryDate) return `Draft leg ${number}: select an expiry month and valid Zerodha contract.`;
+      if (leg.instrumentType === "OPTION" && (!leg.optionType || Number(leg.strike) <= 0)) return `Draft leg ${number}: select CE/PE and a valid strike.`;
+    }
+    return null;
   }
 
-      if (
-        leg.entryPrice === "" ||
-        !Number.isFinite(entryPrice) ||
-        entryPrice < 0
-      ) {
-        return `Draft leg ${legNumber}: enter a valid entry price.`;
+  function validateClosures() {
+    for (const plan of plannedClosures) {
+      const position = currentPositions.find((item) => item.id === plan.positionId);
+      if (!position) return "A selected position is no longer available.";
+      const open = Number(position.open_quantity ?? 0);
+      const price = Number(plan.price);
+      if (!Number.isInteger(plan.quantityToClose) || plan.quantityToClose <= 0 || plan.quantityToClose > open) {
+        return `Invalid close quantity for ${describePosition(position)}.`;
       }
-
-      if (!leg.expiryDate) {
-        return `Draft leg ${legNumber}: select an expiry month and valid Zerodha contract.`;
-      }
-
-      if (leg.instrumentType === "OPTION") {
-        const strike = Number(leg.strike);
-
-        if (leg.optionType !== "CE" && leg.optionType !== "PE") {
-          return `Draft leg ${legNumber}: select CE or PE.`;
-        }
-
-        if (!Number.isFinite(strike) || strike <= 0) {
-          return `Draft leg ${legNumber}: enter a valid strike.`;
-        }
-      }
-
-      if (
-        leg.instrumentType === "FUTURE" &&
-        entryPrice <= 0
-      ) {
-        return `Draft leg ${legNumber}: futures entry price must be greater than zero.`;
+      if (plan.price === "" || !Number.isFinite(price) || price < 0) {
+        return `Enter a valid closing price for ${describePosition(position)}.`;
       }
     }
-
     return null;
   }
 
   function completeDraft() {
-    setErrorMessage("");
     setDraftErrorMessage("");
-
-    const validationError = validateDraftForPreview();
-
-    if (validationError) {
-      setDraftErrorMessage(validationError);
+    if (!hasChanges) {
+      setDraftErrorMessage("Simulate at least one closure or add at least one valid new leg.");
       return;
     }
-
-    setConfirmedDraftLegs(draftStrategyLegs);
+    const newLegError = validateNewLegs();
+    if (newLegError) { setDraftErrorMessage(newLegError); return; }
+    const closeError = validateClosures();
+    if (closeError) { setDraftErrorMessage(closeError); return; }
+    if (previewStrategyLegs.length === 0) {
+      setDraftErrorMessage("This adjustment would leave no open strategy. Use the strategy closure workflow instead.");
+      return;
+    }
     setDraftConfirmed(true);
   }
 
-  function editDraft() {
-    setDraftConfirmed(false);
-    setConfirmedDraftLegs([]);
-  }
-
-  function validateForm(): string | null {
-    if (!strategy) {
-      return "Strategy could not be loaded.";
-    }
-
-    if (strategy.status === "CLOSED") {
-      return "A closed strategy cannot be adjusted.";
-    }
-
-    if (!adjustmentDate) {
-      return "Please enter the adjustment date.";
-    }
-
-    const spot = Number(underlyingSpot);
-
-    if (
-    underlyingSpot === "" ||
-      !Number.isFinite(spot) ||
-      spot <= 0
-    ) {
-      return "Please enter a valid underlying spot price.";
-    }
-
-    if (!reason.trim()) {
-      return "Please enter the reason for the adjustment.";
-    }
-
-    if (legs.length === 0) {
-      return "At least one adjustment leg is required.";
-    }
-
-    for (let index = 0; index < legs.length; index += 1) {
-      const leg = legs[index];
-      const legNumber =index + 1;
-
-      const quantity = Number(leg.quantity);
-      const entryPrice = Number(leg.entryPrice);
-      const strike = Number(leg.strike);
-
- if (!Number.isInteger(quantity) || quantity <= 0) {
-        return `Leg ${legNumber}: quantity must be a positive whole number.`;
-      }
-
-      if (
-     leg.entryPrice === "" ||
-        !Number.isFinite(entryPrice) ||
-        entryPrice < 0
-      ) {
-        return `Leg ${legNumber}: entry price must be zero or higher.`;
-      }
-
-      if (leg.instrumentType === "OPTION") {
-        if (!leg.optionType) {
-          return `Leg ${legNumber}: select CE or PE.`;
-        }
-
-        if (!Number.isFinite(strike) || strike <= 0) {
-          return `Leg ${legNumber}: enter a valid strike.`;
-        }
-
-   if (!leg.expiryDate) {
-          return `Leg ${legNumber}: select an expiry month and valid Zerodha option contract.`;
-        }
-      }
-
-      if (
-        leg.instrumentType === "FUTURE" &&
-        (!leg.expiryMonth || !leg.expiryDate || !leg.instrumentToken || !leg.lotSize)
-      ) {
-        return `Leg ${legNumber}: select an expiry month and valid Zerodha futures contract.`;
-      }
-    }
-
-    return null;
+  function validateForm() {
+    if (!strategy) return "Strategy could not be loaded.";
+    if (strategy.status === "CLOSED") return "A closed strategy cannot be adjusted.";
+    if (!adjustmentDate) return "Select the adjustment date.";
+    const spot = Number(chartSpot);
+    if (!Number.isFinite(spot) || spot <= 0) return "Refresh prices or enter a valid underlying spot override.";
+    if (!reason.trim()) return "Enter the reason for the adjustment.";
+    if (!hasChanges) return "There are no simulated changes to commit.";
+    return validateNewLegs() ?? validateClosures();
   }
 
   async function saveAdjustment() {
     setErrorMessage("");
-
     if (!draftConfirmed) {
-      setErrorMessage(
-        "Complete the draft and review the preview before committing the adjustment.",
-      );
+      setErrorMessage("Complete the draft and review the preview before committing.");
       return;
     }
-
     const validationError = validateForm();
-
-    if (validationError) {
-      setErrorMessage(validationError);
-      return;
-    }
-
-    if (!strategy) {
-      return;
-    }
+    if (validationError) { setErrorMessage(validationError); return; }
+    if (!strategy) return;
 
     setSaving(true);
-
+    let eventId: number | null = null;
     try {
-      const spot = Number(underlyingSpot);
+      const spot = Number(chartSpot);
+      const closureSummary = plannedClosures.map((plan) => {
+        const position = currentPositions.find((item) => item.id === plan.positionId)!;
+        const closePrice = Number(plan.price);
+        const lotSize = Number(position.lot_size ?? 0);
+        const lotsClosed = lotSize > 0 ? plan.quantityToClose / lotSize : null;
+        const realisedPnl = calculateClosurePnl(position, plan.quantityToClose, closePrice);
+        const remainingQuantity = Math.max(0, Number(position.open_quantity ?? 0) - plan.quantityToClose);
+        return [
+          `• ${describePosition(position)}`,
+          `  Action: ${remainingQuantity === 0 ? "FULL CLOSE" : "PARTIAL CLOSE"}`,
+          `  Closed: ${lotsClosed !== null ? `${formatNumber(lotsClosed)} lot${lotsClosed === 1 ? "" : "s"} · ` : ""}Qty ${formatNumber(plan.quantityToClose)}`,
+          `  Close price: ${formatCurrency(closePrice)}`,
+          `  Realised P&L: ${formatCurrency(realisedPnl)}`,
+          `  Remaining quantity: ${formatNumber(remainingQuantity)}`,
+        ].join("\n");
+      });
 
-      const { data: eventData, error: eventError } =
-        await supabase
-          .from("strategy_events")
- .insert({
+      const newLegSummary = legs
+        .filter((leg) => Number(leg.quantity) > 0 && leg.entryPrice !== "")
+        .map((leg) => {
+          const lotSize = Number(leg.lotSize ?? 0);
+          const quantity = Number(leg.quantity);
+          const lots = leg.instrumentType !== "EQUITY" && lotSize > 0 ? quantity / lotSize : null;
+          const contract = leg.instrumentType === "OPTION"
+            ? `${leg.positionSide} ${leg.strike} ${leg.optionType}`
+            : `${leg.positionSide} ${leg.instrumentType}`;
+          return [
+            `• ${contract}`,
+            leg.tradingsymbol ? `  Contract: ${leg.tradingsymbol}` : null,
+            leg.expiryDate ? `  Expiry: ${leg.expiryDate}` : null,
+            `  Size: ${lots !== null ? `${formatNumber(lots)} lot${lots === 1 ? "" : "s"} · ` : ""}Qty ${formatNumber(quantity)}`,
+            `  Entry price: ${formatCurrency(Number(leg.entryPrice))}`,
+          ].filter(Boolean).join("\n");
+        });
+
+      const eventNotes = [
+        "ADJUSTMENT ACTIONS",
+        closureSummary.length ? `CLOSED / REDUCED LEGS\n${closureSummary.join("\n\n")}` : null,
+        newLegSummary.length ? `ADDED LEGS\n${newLegSummary.join("\n\n")}` : null,
+        `PROFIT POTENTIAL
+Before: ${currentRealisticMaxProfit === null ? "—" : formatCurrency(currentRealisticMaxProfit)}
+After: ${previewRealisticMaxProfit === null ? "—" : formatCurrency(previewRealisticMaxProfit)}
+Change: ${currentRealisticMaxProfit !== null && previewRealisticMaxProfit !== null ? formatCurrency(previewRealisticMaxProfit - currentRealisticMaxProfit) : "—"}`,
+        notes.trim() ? `TRADER NOTE\n${notes.trim()}` : null,
+      ].filter(Boolean).join("\n\n");
+
+      const { data: eventData, error: eventError } = await supabase
+        .from("strategy_events")
+        .insert({
+          strategy_id: strategy.strategy_id,
+          event_type: "ADJUSTMENT",
+          event_date: `${adjustmentDate}T${new Date().toTimeString().slice(0, 8)}`,
+          underlying_spot: spot,
+          reason: reason.trim(),
+          notes: eventNotes || null,
+        })
+        .select("id")
+        .single();
+
+      if (eventError || !eventData) throw new Error(`Unable to save adjustment event: ${eventError?.message ?? "No event ID returned"}`);
+      eventId = eventData.id;
+
+      for (const plan of plannedClosures) {
+        const position = currentPositions.find((item) => item.id === plan.positionId);
+        if (!position) throw new Error(`Position ${plan.positionId} is no longer available.`);
+
+        const price = Number(plan.price);
+        const open = Number(position.open_quantity ?? 0);
+        const newOpen = open - plan.quantityToClose;
+        const newClosed = Number(position.closed_quantity ?? 0) + plan.quantityToClose;
+        const realisedThisClose = calculateClosurePnl(position, plan.quantityToClose, price);
+        const newRealised = Number(position.realised_pnl ?? 0) + realisedThisClose;
+
+        const { data: closureRecord, error: closureError } = await supabase
+          .from("position_closures")
+          .insert({
+            position_id: position.id,
             strategy_id: strategy.strategy_id,
-            event_type: "ADJUSTMENT",
-            event_date: `${adjustmentDate}T00:00:00`,
-         underlying_spot: spot,
-            reason: reason.trim(),
-            notes: notes.trim() || null,
+            close_date: adjustmentDate,
+            close_price: price,
+            quantity_closed: plan.quantityToClose,
+            realised_pnl: realisedThisClose,
+            closing_reason: reason.trim(),
+            notes: `Adjustment event ${eventId}`,
           })
           .select("id")
-   .single();
+          .single();
 
-      if (eventError || !eventData) {
-        throw new Error(
-          `Unable to save adjustment event: ${
-            eventError?.message ?? "No event ID returned"
-          }`,
-        );
+        if (closureError || !closureRecord) throw new Error(`Unable to record closure for ${describePosition(position)}: ${closureError?.message ?? "No closure record"}`);
+
+        const { error: positionError } = await supabase
+          .from("book_positions")
+          .update({
+            open_quantity: newOpen,
+            closed_quantity: newClosed,
+            current_price: price,
+            realised_pnl: newRealised,
+            mtm: newOpen === 0 ? 0 : calculateClosurePnl(position, newOpen, price),
+            status: newOpen === 0 ? "CLOSED" : "PARTIALLY_CLOSED",
+          })
+          .eq("id", position.id);
+
+        if (positionError) throw new Error(`Unable to update ${describePosition(position)}: ${positionError.message}`);
       }
 
-      const eventId = eventData.id;
-
-      const positionRows = legs.map((leg) => {
-      const quantity = Number(leg.quantity);
-        const entryPrice = Number(leg.entryPrice);
-
-        return {
+      const newLegRows = legs
+        .filter((leg) => Number(leg.quantity) > 0 && leg.entryPrice !== "")
+        .map((leg) => ({
           strategy_id: strategy.strategy_id,
           strategy_event_id: eventId,
           strategy_name: strategy.strategy_name,
           symbol: strategy.symbol,
-
-          instrument_type:leg.instrumentType,
-
-          option_type:
-            leg.instrumentType === "OPTION"
-              ? leg.optionType
-              : null,
-
-  strike:
-            leg.instrumentType === "OPTION"
-              ? Number(leg.strike)
-              : null,
-
-          expiry_date:
-            leg.instrumentType === "OPTION" ||
-            leg.instrumentType === "FUTURE"
-              ? leg.expiryDate
-              : null,
-
+          instrument_type: leg.instrumentType,
+          option_type: leg.instrumentType === "OPTION" ? leg.optionType : null,
+          strike: leg.instrumentType === "OPTION" ? Number(leg.strike) : null,
+          expiry_date: leg.instrumentType === "OPTION" || leg.instrumentType === "FUTURE" ? leg.expiryDate : null,
           position_side: leg.positionSide,
-
-          quantity,
-          open_quantity: quantity,
+          quantity: Number(leg.quantity),
+          open_quantity: Number(leg.quantity),
           closed_quantity: 0,
-
           entry_date: adjustmentDate,
-     entry_price: entryPrice,
-          current_price: entryPrice,
-
+          entry_price: Number(leg.entryPrice),
+          current_price: Number(leg.entryPrice),
           contract_multiplier: 1,
-
           mtm: 0,
           realised_pnl: 0,
-      status: "OPEN",
-
+          status: "OPEN",
           trade_rationale: reason.trim(),
           notes: notes.trim() || null,
+          exchange: leg.instrumentType === "EQUITY" ? "NSE" : "NFO",
+          tradingsymbol: leg.instrumentType === "EQUITY" ? strategy.symbol : leg.tradingsymbol,
+          instrument_token: leg.instrumentType === "EQUITY" ? null : leg.instrumentToken,
+          lot_size: leg.instrumentType === "EQUITY" ? null : leg.lotSize,
+        }));
 
-          exchange:
-            leg.instrumentType === "EQUITY"
-              ? "NSE"
-              : "NFO",
+      if (newLegRows.length > 0) {
+        const { error: legsError } = await supabase.from("book_positions").insert(newLegRows);
+        if (legsError) throw new Error(`Unable to save new legs: ${legsError.message}`);
+      }
 
-          tradingsymbol:
-            leg.instrumentType === "EQUITY"
-              ? strategy.symbol
-              : leg.tradingsymbol,
-
-          instrument_token:
-            leg.instrumentType === "EQUITY" ? null : leg.instrumentToken,
-          lot_size:
-            leg.instrumentType === "EQUITY" ? null : leg.lotSize,
-        };
-      });
-
-      const { error: legsError } = await supabase
+      const { data: allPositions, error: totalsError } = await supabase
         .from("book_positions")
-        .insert(positionRows);
+        .select("open_quantity,realised_pnl,mtm")
+        .eq("strategy_id", strategy.strategy_id);
+      if (totalsError) throw new Error(`Adjustment saved, but strategy totals could not be read: ${totalsError.message}`);
 
-      if (legsError) {
-        await supabase
-          .from("strategy_events")
-          .delete()
-          .eq("id", eventId);
+      const realisedPnl = (allPositions ?? []).reduce((sum, position) => sum + Number(position.realised_pnl ?? 0), 0);
+      const unrealisedMtm = (allPositions ?? []).reduce((sum, position) => sum + (Number(position.open_quantity ?? 0) > 0 ? Number(position.mtm ?? 0) : 0), 0);
 
-        throw new Error(
-          `Adjustment event was created, but the new legs could not be saved: ${legsError.message}`,
-        );
+      const { error: strategyUpdateError } = await supabase
+        .from("strategy_master")
+        .update({
+          realised_pnl: realisedPnl,
+          unrealised_mtm: unrealisedMtm,
+          total_pnl: realisedPnl + unrealisedMtm,
+        })
+        .eq("strategy_id", strategy.strategy_id);
+      if (strategyUpdateError) throw new Error(`Adjustment saved, but strategy totals could not be updated: ${strategyUpdateError.message}`);
+
+      const maxProfitChange =
+        currentRealisticMaxProfit !== null && previewRealisticMaxProfit !== null
+          ? previewRealisticMaxProfit - currentRealisticMaxProfit
+          : null;
+      const maxProfitChangePct =
+        currentRealisticMaxProfit !== null && currentRealisticMaxProfit > 0 && previewRealisticMaxProfit !== null
+          ? ((previewRealisticMaxProfit - currentRealisticMaxProfit) / currentRealisticMaxProfit) * 100
+          : null;
+      const currentCapturePct =
+        previewRealisticMaxProfit !== null && previewRealisticMaxProfit > 0
+          ? Math.max(0, (unrealisedMtm / previewRealisticMaxProfit) * 100)
+          : null;
+
+      const { error: profitSnapshotError } = await supabase
+        .from("strategy_profit_snapshots")
+        .insert({
+          strategy_id: strategy.strategy_id,
+          strategy_event_id: eventId,
+          event_type: "ADJUSTMENT",
+          captured_at: new Date().toISOString(),
+          current_spot_price: spot,
+          realistic_max_profit_before: currentRealisticMaxProfit,
+          realistic_max_profit_after: previewRealisticMaxProfit,
+          max_profit_change: maxProfitChange,
+          max_profit_change_pct: maxProfitChangePct,
+          realised_pnl_at_event: realisedPnl,
+          unrealised_mtm_at_event: unrealisedMtm,
+          total_pnl_at_event: realisedPnl + unrealisedMtm,
+          current_capture_pct: currentCapturePct,
+        });
+
+      if (profitSnapshotError) {
+        throw new Error(`Adjustment was saved, but profit-potential snapshot failed: ${profitSnapshotError.message}`);
       }
 
       const marginResponse = await fetch("/api/strategy/recalculate-margin", {
@@ -925,59 +827,31 @@ instrumentType: "OPTION" as const,
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ strategy_id: strategy.strategy_id }),
       });
-      const marginPayload = await marginResponse.json().catch(() => ({}));
-      if (!marginResponse.ok) {
-        throw new Error(
-          `Adjustment saved, but margin recalculation failed: ${marginPayload?.detail ?? "Unknown margin error"}`,
-        );
-      }
+      const marginText = await marginResponse.text();
+      let marginPayload: any = {};
+      try { marginPayload = marginText ? JSON.parse(marginText) : {}; } catch { marginPayload = { detail: marginText }; }
+      if (!marginResponse.ok) throw new Error(`Adjustment saved, but margin recalculation failed: ${marginPayload?.detail ?? "Unknown margin error"}`);
 
-      router.push(
-        `/strategies/${encodeURIComponent(
-          strategy.strategy_id,
-        )}`,
-      );
-
+      router.push(`/strategies/${encodeURIComponent(strategy.strategy_id)}`);
       router.refresh();
     } catch (error) {
-      setErrorMessage(
-        error instanceof Error
-          ? error.message
-          : "An unexpected error occurred.",
-      );
+      setErrorMessage(error instanceof Error ? error.message : "Unable to commit adjustment.");
     } finally {
       setSaving(false);
     }
   }
 
   if (loading) {
-    return (
-      <main className="min-h-screen bg-gray-50 p-10">
-        <p className="text-gray-600">
-          Loading strategy...
-        </p>
-      </main>
-    );
- }
+    return <main className="min-h-screen bg-gray-50 p-10"><p className="text-gray-600">Loading strategy...</p></main>;
+  }
 
   if (!strategy) {
     return (
       <main className="min-h-screen bg-gray-50 p-10">
         <div className="mx-auto max-w-3xl rounded border border-gray-300 bg-white p-6">
-          <h1 className="text-2xl font-semibold">
-            Unable to load strategy
-          </h1>
-
-          <p className="mt-2 text-gray-600">
-            {errorMessage || "Strategy not found."}
-          </p>
-
-          <Link
-            href="/strategies"
-    className="mt-5 inline-block font-semibold underline underline-offset-4"
-          >
-            Return to Strategies
-          </Link>
+          <h1 className="text-2xl font-semibold">Unable to load strategy</h1>
+          <p className="mt-2 text-gray-600">{errorMessage || "Strategy not found."}</p>
+          <Link href="/strategies" className="mt-5 inline-block font-semibold underline underline-offset-4">Return to Strategies</Link>
         </div>
       </main>
     );
@@ -989,425 +863,221 @@ instrumentType: "OPTION" as const,
         <header className="rounded-xl border border-gray-300 bg-white px-6 py-5 shadow-sm">
           <div className="flex flex-col gap-5 lg:flex-row lg:items-center lg:justify-between">
             <div>
-              <p className="text-xs font-semibold uppercase tracking-[0.18em] text-gray-500">
-                {strategy.symbol}
-              </p>
+              <p className="text-xs font-semibold uppercase tracking-[0.18em] text-gray-500">{strategy.symbol}</p>
               <h1 className="mt-2 text-3xl font-bold">Adjustment Studio</h1>
               <p className="mt-2 text-sm text-gray-600">{strategy.strategy_name}</p>
             </div>
-            <div className="flex flex-col items-start gap-3 sm:flex-rowsm:items-center">
-              <div className="rounded-lg border border-blue-200 bg-blue-50 px-4 py-3">
-                <p className="text-xs font-semibold uppercase tracking-[0.12em] text-blue-700">
-                  Simulation mode
-                </p>
-                <p className="mt-1 text-xs text-blue-700">
-                  Nothing is saved until you commit the adjustment.
-                </p>
-              </div>
-              <Link
- href={`/strategies/${encodeURIComponent(strategy.strategy_id)}`}
-                className="rounded border border-gray-400 px-4 py-3 text-sm font-semibold"
-              >
-                Return to Strategy
-              </Link>
+            <div className="flex flex-wrap gap-3">
+              <button type="button" onClick={refreshExistingPrices} disabled={refreshingPrices} className="rounded border border-blue-500 bg-blue-50 px-4 py-3 text-sm font-semibold text-blue-700 disabled:opacity-50">
+                {refreshingPrices ? "Refreshing..." : "Refresh Live Prices"}
+              </button>
+              <Link href={`/strategies/${encodeURIComponent(strategy.strategy_id)}`} className="rounded border border-gray-400 px-4 py-3 text-sm font-semibold">Return to Strategy</Link>
             </div>
           </div>
-        </header>
-
-        <section className="mt-6 grid items-start gap-6 xl:grid-cols-[45fr_55fr]">
-          <div className="rounded-xl border border-gray-300 bg-white p-6 shadow-sm">
-     <div className="flex items-center justify-between border-b border-gray-200 pb-4">
-              <div>
-                <p className="text-xs font-semibold uppercase tracking-[0.16em] text-gray-500">Strategy context</p>
-                <h2 className="mt-1 text-xl font-semibold">Current position</h2>
-          </div>
-              <span className="rounded border border-gray-300 px-3 py-1 text-xs font-semibold">
-                {strategy.status}
-       </span>
-            </div>
-
-            <div className="mt-5 grid gap-4 sm:grid-cols-2">
-              <ContextMetric label="Symbol" value={strategy.symbol} />
-              <ContextMetric label="Strategy" value={strategy.strategy_name} />
-              <ContextMetric label="Status" value={strategy.status} />
-              <ContextMetric
-                label="Entry spot"
-                value={
-                  strategy.entry_spot_price === null
-                    ? "—"
-                    : `₹${strategy.entry_spot_price.toLocaleString(
-                        "en-IN",
-  { maximumFractionDigits: 2 },
-                      )}`
-                }
-              />
-              <ContextMetric
-                label="Open legs"
-                value={String(currentPositions.length)}
-              />
-              <ContextMetric label="Strategy ID" value={strategy.strategy_id} />
-            </div>
-
-            <div className="mt-6 rounded-lg border border-dashed border-gray-300 bg-gray-50 p-5">
-              <p className="text-sm font-semibold">Current strategy details</p>
-              <p className="mt-2 text-sm leading-6 text-gray-500">
-                Open legs, MTM, thesis, adjustment plan and current payoff will appear here in the next sprint.
+          <div className="mt-4 flex flex-wrap items-center gap-3">
+            <div className="rounded-lg border border-green-200 bg-green-50 px-4 py-3">
+              <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-green-700">Live Zerodha spot</p>
+              <p className="mt-1 text-xl font-bold text-green-900">{liveSpot !== null ? formatCurrency(liveSpot) : "Waiting for refresh…"}</p>
+              <p className="mt-1 text-[11px] text-green-700">
+                {liveSpotUpdatedAt ? `Updated ${new Date(liveSpotUpdatedAt).toLocaleString("en-IN")}` : "The chart will switch to live spot after refresh."}
               </p>
             </div>
+            {underlyingSpot !== "" && (
+              <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3">
+                <p className="text-[10px] font-semibold uppercase tracking-[0.14em] text-amber-700">Scenario override active</p>
+                <p className="mt-1 text-sm font-semibold text-amber-900">Chart spot {formatCurrency(Number(underlyingSpot))}</p>
+              </div>
+            )}
+          </div>
+          {priceMessage && <p className="mt-3 text-sm text-green-700">{priceMessage}</p>}
+        </header>
+
+        <section className="mt-6 rounded-xl border border-gray-300 bg-white p-6 shadow-sm">
+          <div className="flex flex-col gap-2 border-b border-gray-200 pb-4 md:flex-row md:items-end md:justify-between">
+            <div>
+              <p className="text-xs font-semibold uppercase tracking-[0.16em] text-gray-500">Existing legs</p>
+              <h2 className="mt-1 text-xl font-semibold">Keep, partially close, or close</h2>
+              <p className="mt-2 text-sm text-gray-500">Closing prices start from Zerodha LTP. You can override the simulated execution price before commit.</p>
+            </div>
+            <p className="text-xs text-gray-500">Nothing below is saved until Commit Adjustment.</p>
           </div>
 
-          <div className="rounded-xl border border-gray-300 bg-white p-6 shadow-sm">
-            <div className="flex flex-col gap-3 border-b border-gray-200 pb-4 md:flex-row md:items-center md:justify-between">
-              <div>
-                <p className="text-xs font-semibold uppercase tracking-[0.16em] text-gray-500">Adjustment builder</p>
-                <h2 className="mt-1 text-xl font-semibold">Draft adjustment</h2>
-              </div>
-              <div className="flex flex-wrap gap-2">
-                <button
-                  type="button"
-                  onClick={addLeg}
-                  disabled={draftConfirmed}
-                  className="rounded border border-gray-400 px-4 py-2 text-sm font-semibold disabled:cursor-not-allowed disabled:opacity-40"
-     >
-                  + Add Leg
-                </button>
+          <div className="mt-5 space-y-3">
+            {currentPositions.map((position) => {
+              const openQty = Number(position.open_quantity ?? 0);
+              const lotSize = Number(position.lot_size ?? 0);
+              const plan = closePlans[position.id];
+              const closeQty = plan?.quantityToClose ?? 0;
+              const remainingQty = Math.max(0, openQty - closeQty);
+              const openLots = lotSize > 0 ? openQty / lotSize : null;
+              const closeLots = lotSize > 0 ? closeQty / lotSize : null;
+              const maxWholeLots = lotSize > 0 ? Math.floor(openQty / lotSize) : 0;
 
-                {draftConfirmed ? (
-                  <button
-                    type="button"
-                    onClick={editDraft}
-                    className="rounded border border-blue-500 bg-blue-50 px-4 py-2 text-sm font-semibold text-blue-700"
-                  >
-                    Edit Draft
-                  </button>
-                ) : (
-                  <button
-      type="button"
-                    onClick={completeDraft}
-                    className="rounded bg-blue-600 px-4 py-2 text-sm font-semibold text-white"
-                  >
-                    Complete Draft
-                  </button>
-                )}
-              </div>
+              return (
+                <div key={position.id} className={`rounded-lg border p-4 ${closeQty > 0 ? "border-orange-300 bg-orange-50" : "border-gray-200 bg-gray-50"}`}>
+                  <div className="grid gap-4 lg:grid-cols-[1.5fr_repeat(4,1fr)] lg:items-center">
+                    <div>
+                      <p className="text-sm font-bold">{describePosition(position)}</p>
+                      <p className="mt-1 text-xs text-gray-500">{position.tradingsymbol ?? position.expiry_date ?? "Open position"}</p>
+                    </div>
+                    <Metric label="Open" value={openLots !== null ? `${formatNumber(openLots)} lots · ${openQty}` : String(openQty)} />
+                    <Metric label="Entry" value={formatCurrency(position.entry_price)} />
+                    <Metric label="Live LTP" value={formatCurrency(position.current_price)} />
+                    <Metric label="MTM" value={formatCurrency(position.mtm)} />
+                  </div>
+
+                  <div className="mt-4 flex flex-wrap items-end gap-3 border-t border-gray-200 pt-4">
+                    <button type="button" disabled={draftConfirmed} onClick={() => setCloseQuantity(position, 0)} className={`rounded px-3 py-2 text-xs font-semibold ${closeQty === 0 ? "bg-gray-950 text-white" : "border border-gray-300 bg-white"}`}>Keep</button>
+                    {lotSize > 0 ? (
+                      <label className="text-xs font-semibold text-gray-600">
+                        Close lots
+                        <select disabled={draftConfirmed} value={closeLots ?? 0} onChange={(event) => setCloseLots(position, Number(event.target.value))} className="ml-2 rounded border border-gray-300 bg-white px-3 py-2">
+                          <option value="0">0</option>
+                          {Array.from({ length: maxWholeLots }, (_, index) => index + 1).map((lots) => <option key={lots} value={lots}>{lots}</option>)}
+                        </select>
+                      </label>
+                    ) : (
+                      <label className="text-xs font-semibold text-gray-600">
+                        Close quantity
+                        <input disabled={draftConfirmed} type="number" min="0" max={openQty} step="1" value={closeQty} onChange={(event) => setCloseQuantity(position, Number(event.target.value))} className="ml-2 w-24 rounded border border-gray-300 bg-white px-3 py-2" />
+                      </label>
+                    )}
+                    <button type="button" disabled={draftConfirmed} onClick={() => setCloseQuantity(position, openQty)} className="rounded border border-orange-400 bg-white px-3 py-2 text-xs font-semibold text-orange-700">Close All</button>
+                    {closeQty > 0 && (
+                      <label className="text-xs font-semibold text-gray-600">
+                        Simulated close price
+                        <input disabled={draftConfirmed} type="number" step="0.01" min="0" value={plan?.price ?? ""} onChange={(event) => updateClosePrice(position.id, event.target.value)} className="ml-2 w-32 rounded border border-gray-300 bg-white px-3 py-2" />
+                      </label>
+                    )}
+                    <span className="ml-auto text-xs font-semibold text-gray-600">Remaining: {remainingQty}</span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </section>
+
+        <section className="mt-6 rounded-xl border border-gray-300 bg-white p-6 shadow-sm">
+          <div className="flex flex-col gap-3 border-b border-gray-200 pb-4 md:flex-row md:items-center md:justify-between">
+            <div>
+              <p className="text-xs font-semibold uppercase tracking-[0.16em] text-gray-500">New legs</p>
+              <h2 className="mt-1 text-xl font-semibold">Build the resulting strategy</h2>
             </div>
+            <div className="flex gap-2">
+              <button type="button" onClick={addLeg} disabled={draftConfirmed} className="rounded border border-gray-400 px-4 py-2 text-sm font-semibold disabled:opacity-40">+ Add Leg</button>
+              {draftConfirmed ? (
+                <button type="button" onClick={() => setDraftConfirmed(false)} className="rounded border border-blue-500 bg-blue-50 px-4 py-2 text-sm font-semibold text-blue-700">Edit Draft</button>
+              ) : (
+                <button type="button" onClick={completeDraft} className="rounded bg-blue-600 px-4 py-2 text-sm font-semibold text-white">Complete Draft</button>
+              )}
+            </div>
+          </div>
 
-          {draftErrorMessage && (
-              <div className="mt-4 rounded border border-red-300 bg-red-50 px-4 py-3">
-                <p className="text-sm font-semibold text-red-900">
-                  Draft is not complete
-                </p>
+          {contractError && <p className="mt-4 text-sm text-red-700">{contractError}</p>}
+          {draftErrorMessage && <div className="mt-4 rounded border border-red-300 bg-red-50 p-3 text-sm text-red-800">{draftErrorMessage}</div>}
+          {draftConfirmed && <div className="mt-4 rounded border border-green-200 bg-green-50 p-3 text-sm text-green-800">Draft locked. The preview below is the strategy that will be committed.</div>}
 
-                <p className="mt-1 text-sm text-red-800">
-                  {draftErrorMessage}
-                </p>
-              </div>
-            )}
-
-            {draftConfirmed && (
-              <div className="mt-5 rounded border border-green-200 bg-green-50 px-4 py-3">
-                <p className="text-sm font-semibold text-green-800">
-    Draft completed
-                </p>
-
-                <p className="mt-1 text-xs text-green-700">
-                  The preview is based on this locked draft. Select Edit Draft to make changes.
-                </p>
-              </div>
-            )}
-
-            <fieldset disabled={draftConfirmed}>
-             <div className="mt-5 grid gap-5 md:grid-cols-2">
-              <Field label="Adjustment date">
-                <input type="date" value={adjustmentDate} onChange={(event) => setAdjustmentDate(event.target.value)} className="w-full rounded border border-gray-300 px-4 py-3" />
-              </Field>
-              <Field label="Underlying spot">
-                <input type="number" step="0.01" min="0" value={underlyingSpot} onChange={(event)=> setUnderlyingSpot(event.target.value)} placeholder="Spot at adjustment" className="w-full rounded border border-gray-300 px-4 py-3" />
+          <fieldset disabled={draftConfirmed}>
+            <div className="mt-5 grid gap-5 md:grid-cols-2">
+              <Field label="Adjustment date"><input type="date" value={adjustmentDate} onChange={(event) => { resetDraftConfirmation(); setAdjustmentDate(event.target.value); }} className="w-full rounded border border-gray-300 px-4 py-3" /></Field>
+              <Field label="Scenario spot override (optional)">
+                <input type="number" step="0.01" min="0" value={underlyingSpot} onChange={(event) => { resetDraftConfirmation(); setUnderlyingSpot(event.target.value); }} placeholder={liveSpot !== null ? `Live spot ${liveSpot}` : "Leave blank to use live Zerodha spot"} className="w-full rounded border border-gray-300 px-4 py-3" />
+                <p className="mt-1 text-xs text-gray-500">Leave blank for the live Zerodha spot. Enter a value only to simulate a different underlying level.</p>
               </Field>
             </div>
-
-            <div className="mt-5">
-              <Field label="Reason for adjustment">
-                <textarea value={reason} onChange={(event) => setReason(event.target.value)} rows={3} placeholder="What problem are you trying to solve?" className="w-full rounded border border-gray-300 px-4 py-3" />
-              </Field>
-            </div>
-
-            <div className="mt-5">
-              <Field label="Additional notes">
-                <textarea value={notes} onChange={(event) => setNotes(event.target.value)} rows={3} placeholder="What should this adjustment achieve?" className="w-full rounded border border-gray-300 px-4 py-3" />
-              </Field>
-            </div>
+            <div className="mt-5"><Field label="Reason for adjustment"><textarea value={reason} onChange={(event) => { resetDraftConfirmation(); setReason(event.target.value); }} rows={3} placeholder="What problem are you trying to solve?" className="w-full rounded border border-gray-300 px-4 py-3" /></Field></div>
+            <div className="mt-5"><Field label="Additional notes"><textarea value={notes} onChange={(event) => { resetDraftConfirmation(); setNotes(event.target.value); }} rows={3} placeholder="What should this adjustment achieve?" className="w-full rounded border border-gray-300 px-4 py-3" /></Field></div>
 
             <div className="mt-6 space-y-4">
-           {legs.map((leg, index) => {
+              {legs.map((leg, index) => {
                 const isOption = leg.instrumentType === "OPTION";
                 const isFuture = leg.instrumentType === "FUTURE";
-
                 return (
                   <div key={leg.id} className="rounded-lg border border-gray-300 bg-gray-50 p-4">
-         <div className="flex items-center justify-between gap-3">
-                      <div>
-                        <p className="text-xs font-semibold uppercase tracking-[0.12em] text-gray-500">Draft leg {index + 1}</p>
-                        <p className="mt-1 text-sm font-semibold">
-         {leg.positionSide} {isOption ? `${leg.strike || "—"} ${leg.optionType || ""}` : leg.instrumentType}
-                        </p>
-       </div>
-                      {legs.length > 1 && (
-                        <button type="button" onClick={() => removeLeg(leg.id)} className="text-sm font-semibold underline underline-offset-4">Remove</button>
-                      )}
+                    <div className="flex items-center justify-between">
+                      <p className="text-sm font-semibold">New leg {index + 1}</p>
+                      <button type="button" onClick={() => removeLeg(leg.id)} className="text-xs font-semibold underline underline-offset-4">Remove</button>
                     </div>
-
                     <div className="mt-4 grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-                      <Field label="Instrument">
-                        <select value={leg.instrumentType} onChange={(event) => updateLeg(leg.id, "instrumentType", event.target.value)} className="w-full rounded border border-gray-300 bg-white px-3 py-3">
-                     <option value="OPTION">Option</option>
-                          <option value="FUTURE">Future</option>
-                          <option value="EQUITY">Cash Equity</option>
-                        </select>
-                      </Field>
-
-                      <Field label="Buy / Sell">
-                        <select value={leg.positionSide} onChange={(event) => updateLeg(leg.id, "positionSide", event.target.value)} className="w-full rounded border border-gray-300 bg-white px-3 py-3">
-                          <option value="BUY">Buy</option>
-                          <option value="SELL">Sell</option>
-                        </select>
-                      </Field>
-
-                      {isOption && (
-                        <Field label="Option type">
-                          <select value={leg.optionType} onChange={(event) => updateLeg(leg.id, "optionType", event.target.value)}className="w-full rounded border border-gray-300 bg-white px-3 py-3">
-                            <option value="PE">PE</option>
-    <option value="CE">CE</option>
-                          </select>
-                        </Field>
-                      )}
-
-{isOption && (
-                        <Field label="Strike">
-                          <input type="number" value={leg.strike} onChange={(event) => updateLeg(leg.id, "strike", event.target.value)} className="w-full rounded border border-gray-300 bg-white px-3 py-3" />
-                        </Field>
-                   )}
-
-                      {(isOption || isFuture) && (
-                        <>
-                          <Field label="Expiry month">
-                            <select
-                              value={leg.expiryMonth}
-                              onChange={(event) => updateLeg(leg.id, "expiryMonth", event.target.value)}
-                              className="w-full rounded border border-gray-300 bg-white px-3 py-3"
-                            >
-                              <option value="">Select month</option>
-                              {EXPIRY_MONTH_OPTIONS.map((month) => (
-                                <option key={month.value} value={month.value}>{month.label}</option>
-                              ))}
-                            </select>
-                          </Field>
-                          <Field label="Lots">
-                            <select
-                              value={leg.lots}
-                              onChange={(event) => updateLots(leg.id, event.target.value)}
-                              className="w-full rounded border border-gray-300 bg-white px-3 py-3"
-                            >
-                              {Array.from({ length: 20 }, (_, item) => item + 1).map((lots) => (
-                                <option key={lots} value={lots}>{lots} lot{lots === 1 ? "" : "s"}</option>
-                              ))}
-                            </select>
-                          </Field>
-                          <Field label="Resolved contract">
-                            <input
-                              value={leg.tradingsymbol ? `${leg.tradingsymbol} · ${leg.expiryDate}` : (loadingContracts ? "Loading Zerodha contracts..." : "Select month / strike")}
-                              readOnly
-                              className="w-full rounded border border-gray-300 bg-gray-100 px-3 py-3 text-gray-600"
-                            />
-                            <p className="mt-1 text-xs text-gray-500">
-                              {leg.lotSize ? `Lot size ${leg.lotSize} · Quantity ${leg.quantity}` : "Exact expiry and quantity are populated automatically"}
-                            </p>
-                          </Field>
-                        </>
-                      )}
-
-                      {leg.instrumentType === "EQUITY" && (
-                        <Field label="Quantity">
-                          <input type="number" value={leg.quantity} onChange={(event) => updateLeg(leg.id, "quantity", event.target.value)} className="w-full rounded border border-gray-300 bg-white px-3 py-3" />
-                        </Field>
-                      )}
-
-                      <Field label="Entry price">
-        <input type="number" step="0.01" min="0" value={leg.entryPrice} onChange={(event) => updateLeg(leg.id, "entryPrice", event.target.value)} className="w-full rounded border border-gray-300 bg-white px-3 py-3" />
-                      </Field>
+                      <Field label="Instrument"><select value={leg.instrumentType} onChange={(event) => updateLeg(leg.id, "instrumentType", event.target.value)} className="w-full rounded border border-gray-300 bg-white px-3 py-3"><option value="OPTION">Option</option><option value="FUTURE">Future</option><option value="EQUITY">Cash Equity</option></select></Field>
+                      <Field label="Buy / Sell"><select value={leg.positionSide} onChange={(event) => updateLeg(leg.id, "positionSide", event.target.value)} className="w-full rounded border border-gray-300 bg-white px-3 py-3"><option value="BUY">Buy</option><option value="SELL">Sell</option></select></Field>
+                      {isOption && <Field label="Option type"><select value={leg.optionType} onChange={(event) => updateLeg(leg.id, "optionType", event.target.value)} className="w-full rounded border border-gray-300 bg-white px-3 py-3"><option value="PE">PE</option><option value="CE">CE</option></select></Field>}
+                      {isOption && <Field label="Strike"><input type="number" value={leg.strike} onChange={(event) => updateLeg(leg.id, "strike", event.target.value)} className="w-full rounded border border-gray-300 bg-white px-3 py-3" /></Field>}
+                      {(isOption || isFuture) && <>
+                        <Field label="Expiry month"><select value={leg.expiryMonth} onChange={(event) => updateLeg(leg.id, "expiryMonth", event.target.value)} className="w-full rounded border border-gray-300 bg-white px-3 py-3"><option value="">Select month</option>{EXPIRY_MONTH_OPTIONS.map((month) => <option key={month.value} value={month.value}>{month.label}</option>)}</select></Field>
+                        <Field label="Lots"><select value={leg.lots} onChange={(event) => updateLots(leg.id, event.target.value)} className="w-full rounded border border-gray-300 bg-white px-3 py-3">{Array.from({ length: 20 }, (_, item) => item + 1).map((lots) => <option key={lots} value={lots}>{lots} lot{lots === 1 ? "" : "s"}</option>)}</select></Field>
+                        <Field label="Resolved contract"><input readOnly value={leg.tradingsymbol ? `${leg.tradingsymbol} · ${leg.expiryDate}` : loadingContracts ? "Loading Zerodha contracts..." : "Select month / strike"} className="w-full rounded border border-gray-300 bg-gray-100 px-3 py-3 text-gray-600" /><p className="mt-1 text-xs text-gray-500">{leg.lotSize ? `Lot size ${leg.lotSize} · Quantity ${leg.quantity}` : "Exact expiry and quantity are automatic"}</p></Field>
+                      </>}
+                      {leg.instrumentType === "EQUITY" && <Field label="Quantity"><input type="number" value={leg.quantity} onChange={(event) => updateLeg(leg.id, "quantity", event.target.value)} className="w-full rounded border border-gray-300 bg-white px-3 py-3" /></Field>}
+                      <Field label="Entry price"><input type="number" step="0.01" min="0" value={leg.entryPrice} onChange={(event) => updateLeg(leg.id, "entryPrice", event.target.value)} className="w-full rounded border border-gray-300 bg-white px-3 py-3" /></Field>
                     </div>
                   </div>
-             );
+                );
               })}
             </div>
-            </fieldset>
+          </fieldset>
+        </section>
+
+        <section className="mt-6 grid gap-4 md:grid-cols-3">
+          <div className="rounded-xl border border-gray-300 bg-white p-5 shadow-sm">
+            <p className="text-xs font-semibold uppercase tracking-[0.14em] text-gray-500">Current realistic max profit</p>
+            <p className="mt-2 text-2xl font-bold">{currentRealisticMaxProfit === null ? "—" : formatCurrency(currentRealisticMaxProfit)}</p>
+          </div>
+          <div className="rounded-xl border border-gray-300 bg-white p-5 shadow-sm">
+            <p className="text-xs font-semibold uppercase tracking-[0.14em] text-gray-500">Resulting realistic max profit</p>
+            <p className="mt-2 text-2xl font-bold">{previewRealisticMaxProfit === null ? "—" : formatCurrency(previewRealisticMaxProfit)}</p>
+          </div>
+          <div className="rounded-xl border border-gray-300 bg-white p-5 shadow-sm">
+            <p className="text-xs font-semibold uppercase tracking-[0.14em] text-gray-500">Adjustment impact</p>
+            <p className="mt-2 text-2xl font-bold">{currentRealisticMaxProfit !== null && previewRealisticMaxProfit !== null ? formatCurrency(previewRealisticMaxProfit - currentRealisticMaxProfit) : "—"}</p>
+            <p className="mt-1 text-xs text-gray-500">Maximum profit can increase or decrease after an adjustment.</p>
           </div>
         </section>
 
         <section className="mt-6">
-          <div className="mb-4 flex flex-col gap-2 md:flex-row md:items-end md:justify-between">
-            <div>
-              <p className="text-xs font-semibold uppercase tracking-[0.16em] text-gray-500">
-                Simulation
-              </p>
-
-              <h2 className="mt-1 text-xl font-semibold">
-                Current vs preview payoff
-              </h2>
-            </div>
-
-            <p className="text-xs text-gray-500">
-   Complete the draft to overlay the proposed strategy on the current payoff.
-            </p>
+          <div className="mb-4">
+            <p className="text-xs font-semibold uppercase tracking-[0.16em] text-gray-500">Simulation</p>
+            <h2 className="mt-1 text-xl font-semibold">Current vs resulting payoff</h2>
+            <p className="mt-2 text-sm text-gray-500">The preview removes simulated closure quantities and adds valid new legs immediately.</p>
+            <p className="mt-1 text-sm font-semibold text-green-700">Chart spot: {chartSpot !== null ? formatCurrency(chartSpot) : "—"}{underlyingSpot !== "" ? " · scenario override" : " · live Zerodha spot"}</p>
           </div>
-
           <div className="min-h-[680px]">
             <PayoffPanel
               legs={currentStrategyLegs}
-              comparisonLegs={
-                draftStrategyLegs.length > 0
-                  ? previewStrategyLegs
-                  : undefined
-              }
+              comparisonLegs={hasChanges ? previewStrategyLegs : undefined}
               currentSpot={chartSpot}
               expiryMonth={strategy.expiry_month}
               primaryLabel="Current"
-            comparisonLabel="Preview"
+              comparisonLabel="Resulting strategy"
               chartHeight={620}
             />
           </div>
-
-          {!draftConfirmed && (
-            <div className="mt-4 rounded-lg border border-dashed border-blue-300 bg-blue-50 px-5 py-4 text-sm text-blue-800">
-              The preview curve updates automatically while you build the adjustment. Complete Draft only locks the proposal before commit.
-            </div>
-          )}
         </section>
 
-        <section className="mt-6 rounded-xl border border-gray-300 bg-white p-6 shadow-sm">
-          <p className="text-xs font-semibold uppercase tracking-[0.16em] text-gray-500">Before vs after</p>
-  <h2 className="mt-1 text-xl font-semibold">Adjustment comparison</h2>
-
-          <div className="mt-5 overflow-x-auto">
-            <table className="w-full min-w-[760px] text-left text-sm">
-              <thead className="bg-gray-100">
-                <tr>
-                  <th className="p-3">Metric</th>
-                  <th className="p-3 text-right">Current</th>
-                  <th className="p-3 text-right">Preview</th>
-                  <th className="p-3 text-right">Difference</th>
-                  <th className="p-3">Impact</th>
-                </tr>
-              </thead>
-   <tbody>
-                {comparisonRows.map((row) => {
-                  const formatter =
-                    row.format === "currency"
-         ? formatComparisonCurrency
-                      : formatComparisonNumber;
-
-                  const toneClass =
-                    row.impactTone === "positive"
-                      ? "text-green-700"
-                      : row.impactTone === "negative"
-                        ? "text-red-700"
-                        : "text-gray-500";
-
-                  return (
-                    <tr
-                      key={row.label}
-        className="border-t border-gray-200"
-                    >
-                      <td className="p-3 font-semibold">
-                        {row.label}
-                      </td>
-
-                      <td className="p-3 text-right">
-                        {formatter(row.current)}
-          </td>
-
-                      <td className="p-3 text-right font-semibold">
-                        {previewMetrics
-                          ? formatter(row.preview)
-                          : "—"}
-                      </td>
-
-                      <td className={`p-3 text-right font-semibold ${toneClass}`}>
-                        {previewMetrics
-                          ? formatter(row.difference)
-                          : "—"}
-           </td>
-
-                      <td className={`p-3 font-semibold ${toneClass}`}>
-                        {previewMetrics
-                          ? row.impact
-                          : "Waiting for valid draft leg"}
-                      </td>
-                    </tr>
-                  );
-    })}
-              </tbody>
-            </table>
-          </div>
-        </section>
-
-        {errorMessage && (
-          <div className="mt-6 rounded border border-red-300 bg-red-50 p-4">
-            <p className="font-semibold text-red-900">Unable to save adjustment</p>
-            <p className="mt-1 text-sm text-red-800">{errorMessage}</p>
-          </div>
-        )}
+        {errorMessage && <div className="mt-6 rounded border border-red-300 bg-red-50 p-4"><p className="font-semibold text-red-900">Unable to save adjustment</p><p className="mt-1 text-sm text-red-800">{errorMessage}</p></div>}
 
         <section className="mt-6 rounded-xl border border-gray-300 bg-white p-6 shadow-sm">
           <div className="flex flex-col gap-5 lg:flex-row lg:items-center lg:justify-between">
             <div>
               <p className="text-xs font-semibold uppercase tracking-[0.16em] text-gray-500">Decision summary</p>
               <h2 className="mt-1 text-xl font-semibold">Review before committing</h2>
-              <p className="mt-2 text-sm text-gray-500">{draftConfirmed
-                ? "Review the quantified payoff changes abovebefore committing the adjustment."
-                : "Complete at least one valid draft leg to generate the preview."}</p>
+              <p className="mt-2 text-sm text-gray-500">{plannedClosures.length} closure action{plannedClosures.length === 1 ? "" : "s"} · {draftStrategyLegs.length} new payoff leg{draftStrategyLegs.length === 1 ? "" : "s"}</p>
             </div>
- <div className="flex flex-col gap-3 sm:flex-row">
-              <Link href={`/strategies/${encodeURIComponent(strategy.strategy_id)}`} className="roundedborder border-gray-400 px-5 py-3 text-center font-semibold">Cancel</Link>
-              <button type="button" onClick={saveAdjustment} disabled={saving ||!draftConfirmed} className="rounded bg-gray-950 px-6 py-3 font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50">
-                {saving ? "Committing..." : "Commit Adjustment"}
-              </button>
+            <div className="flex gap-3">
+              <Link href={`/strategies/${encodeURIComponent(strategy.strategy_id)}`} className="rounded border border-gray-400 px-5 py-3 font-semibold">Cancel</Link>
+              <button type="button" onClick={saveAdjustment} disabled={saving || !draftConfirmed} className="rounded bg-gray-950 px-6 py-3 font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50">{saving ? "Committing..." : "Commit Adjustment"}</button>
             </div>
           </div>
         </section>
       </div>
     </main>
-);
-}
-
-
-type ContextMetricProps = {
-  label: string;
-  value: string;
-};
-
-function ContextMetric({ label, value }: ContextMetricProps) {
-  return (
-   <div className="rounded-lg border border-gray-200 bg-gray-50 p-4">
-      <p className="text-[10px] font-semibold uppercase tracking-[0.12em] text-gray-500">{label}</p>
-      <p className="mt-2 break-words text-sm font-semibold">{value}</p>
-    </div>
   );
 }
 
-type FieldProps = {
-  label: string;
-  children: React.ReactNode;
-};
+function Metric({ label, value }: { label: string; value: string }) {
+  return <div><p className="text-[10px] font-semibold uppercase tracking-[0.12em] text-gray-500">{label}</p><p className="mt-1 text-sm font-semibold">{value}</p></div>;
+}
 
-function Field({ label, children }: FieldProps) {
-  return (
-    <div>
-      <label className="mb-2 block text-sm font-semibold">
-        {label}
-      </label>
-
-      {children}
-    </div>
-  );
+function Field({ label, children }: { label: string; children: React.ReactNode }) {
+  return <div><label className="mb-2 block text-sm font-semibold">{label}</label>{children}</div>;
 }

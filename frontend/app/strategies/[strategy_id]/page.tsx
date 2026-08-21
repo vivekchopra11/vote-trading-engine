@@ -108,6 +108,31 @@ type MonthlyPnlRow = {
   net: number;
 };
 
+type StrategyDailySnapshot = {
+  id: number;
+  snapshot_date: string;
+  captured_at: string;
+  current_spot_price: number | null;
+  unrealised_mtm: number | null;
+  realised_pnl: number | null;
+  total_pnl: number | null;
+  realistic_max_profit: number | null;
+  unrealised_capture_pct: number | null;
+  margin_used: number | null;
+  nearest_dte: number | null;
+  strategy_delta: number | null;
+  strategy_gamma: number | null;
+  strategy_theta: number | null;
+  strategy_vega: number | null;
+  weighted_iv: number | null;
+  delta_lot_equivalent: number | null;
+  delta_up_1pct_lots: number | null;
+  delta_down_1pct_lots: number | null;
+  pnl_up_1pct: number | null;
+  pnl_down_1pct: number | null;
+  theta_efficiency_per_lakh: number | null;
+};
+
 type RefreshStrategyResponse = {
   status: string;
   strategy_id: string;
@@ -424,6 +449,7 @@ export default function StrategyDetailsPage() {
   const [observations, setObservations] = useState<StrategyObservation[]>([]);
   const [events, setEvents] = useState<StrategyEvent[]>([]);
   const [closures, setClosures] = useState<ClosureRecord[]>([]);
+  const [dailySnapshots, setDailySnapshots] = useState<StrategyDailySnapshot[]>([]);
   const [traderNote, setTraderNote] = useState("");
   const [savingTraderNote, setSavingTraderNote] = useState(false);
   const [traderNoteMessage, setTraderNoteMessage] = useState("");
@@ -592,7 +618,7 @@ export default function StrategyDetailsPage() {
           )
           .eq("strategy_id", strategyId)
           .order("event_date", {
-            ascending: true,
+            ascending: false,
           }),
 
         supabase
@@ -678,6 +704,25 @@ export default function StrategyDetailsPage() {
 
     void loadClosures();
   }, [strategyId]);
+
+  const loadDailySnapshots = useCallback(async () => {
+    const { data, error } = await supabase
+      .from("strategy_daily_snapshots")
+      .select(
+        "id,snapshot_date,captured_at,current_spot_price,unrealised_mtm,realised_pnl,total_pnl,realistic_max_profit,unrealised_capture_pct,margin_used,nearest_dte,strategy_delta,strategy_gamma,strategy_theta,strategy_vega,weighted_iv,delta_lot_equivalent,delta_up_1pct_lots,delta_down_1pct_lots,pnl_up_1pct,pnl_down_1pct,theta_efficiency_per_lakh",
+      )
+      .eq("strategy_id", strategyId)
+      .order("snapshot_date", { ascending: false })
+      .limit(60);
+
+    if (!error) {
+      setDailySnapshots((data ?? []) as StrategyDailySnapshot[]);
+    }
+  }, [strategyId]);
+
+  useEffect(() => {
+    void loadDailySnapshots();
+  }, [loadDailySnapshots]);
 
   const openPositions = useMemo(
     () =>
@@ -862,6 +907,8 @@ export default function StrategyDetailsPage() {
       }, { onConflict: "strategy_id,snapshot_date" });
 
     if (snapshotError) throw new Error(snapshotError.message);
+
+    await loadDailySnapshots();
   }
 
   const sortedOpenPositions = useMemo(
@@ -928,6 +975,29 @@ export default function StrategyDetailsPage() {
       b.monthKey.localeCompare(a.monthKey),
     );
   }, [closures, strategy]);
+
+  const latestDailySnapshot = dailySnapshots[0] ?? null;
+  const previousDailySnapshot = dailySnapshots[1] ?? null;
+
+  const dailyMtmChange =
+    latestDailySnapshot && previousDailySnapshot
+      ? Number(latestDailySnapshot.unrealised_mtm ?? 0) -
+        Number(previousDailySnapshot.unrealised_mtm ?? 0)
+      : null;
+
+  const dailyTotalPnlChange =
+    latestDailySnapshot && previousDailySnapshot
+      ? Number(latestDailySnapshot.total_pnl ?? 0) -
+        Number(previousDailySnapshot.total_pnl ?? 0)
+      : null;
+
+  const dailySpotChangePct = (() => {
+    if (!latestDailySnapshot || !previousDailySnapshot) return null;
+    const latestSpot = Number(latestDailySnapshot.current_spot_price ?? 0);
+    const previousSpot = Number(previousDailySnapshot.current_spot_price ?? 0);
+    if (latestSpot <= 0 || previousSpot <= 0) return null;
+    return ((latestSpot - previousSpot) / previousSpot) * 100;
+  })();
 
   const enteredClosingQuantity = Number(closingQuantity);
 
@@ -997,7 +1067,7 @@ export default function StrategyDetailsPage() {
 
       setEvents((current) =>
         [...current, data as StrategyEvent].sort(
-          (a, b) => new Date(a.event_date).getTime() - new Date(b.event_date).getTime(),
+          (a, b) => new Date(b.event_date).getTime() - new Date(a.event_date).getTime(),
         ),
       );
       setTraderNote("");
@@ -2065,6 +2135,155 @@ export default function StrategyDetailsPage() {
             label="Open Legs"
             value={String(openPositions.length)}
           />
+        </section>
+
+        <section className="mt-6 rounded-lg border border-gray-300 bg-white p-6">
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
+            <div>
+              <p className="text-xs font-semibold uppercase tracking-[0.16em] text-gray-500">
+                Daily strategy change
+              </p>
+              <h2 className="mt-1 text-xl font-semibold">What changed since the previous snapshot?</h2>
+              <p className="mt-2 text-sm text-gray-500">
+                One row is maintained per strategy per day. Repeated market refreshes update today&apos;s row; the next trading day creates a new row.
+              </p>
+            </div>
+            <p className="text-xs text-gray-500">
+              {latestDailySnapshot
+                ? `Latest snapshot ${formatDate(latestDailySnapshot.snapshot_date)}`
+                : "Refresh Market Data to create today&apos;s snapshot."}
+            </p>
+          </div>
+
+          {latestDailySnapshot ? (
+            <>
+              <div className="mt-5 grid gap-4 sm:grid-cols-2 xl:grid-cols-5">
+                <SmallSummaryCard
+                  label="Current MTM"
+                  value={formatCurrency(latestDailySnapshot.unrealised_mtm)}
+                  subvalue={
+                    dailyMtmChange === null
+                      ? "First saved snapshot"
+                      : `${formatCurrency(dailyMtmChange)} vs previous day`
+                  }
+                />
+                <SmallSummaryCard
+                  label="Total P&L"
+                  value={formatCurrency(latestDailySnapshot.total_pnl)}
+                  subvalue={
+                    dailyTotalPnlChange === null
+                      ? "No prior comparison yet"
+                      : `${formatCurrency(dailyTotalPnlChange)} vs previous day`
+                  }
+                />
+                <SmallSummaryCard
+                  label="Spot"
+                  value={
+                    latestDailySnapshot.current_spot_price === null
+                      ? "—"
+                      : `₹${formatNumber(latestDailySnapshot.current_spot_price)}`
+                  }
+                  subvalue={
+                    dailySpotChangePct === null
+                      ? "No prior comparison yet"
+                      : `${dailySpotChangePct >= 0 ? "+" : ""}${dailySpotChangePct.toFixed(2)}% vs previous day`
+                  }
+                />
+                <SmallSummaryCard
+                  label="Profit capture"
+                  value={
+                    latestDailySnapshot.unrealised_capture_pct === null
+                      ? "—"
+                      : `${Number(latestDailySnapshot.unrealised_capture_pct).toFixed(1)}%`
+                  }
+                  subvalue={
+                    latestDailySnapshot.realistic_max_profit === null
+                      ? "Realistic max unavailable"
+                      : `${formatCurrency(latestDailySnapshot.unrealised_mtm)} of ${formatCurrency(latestDailySnapshot.realistic_max_profit)}`
+                  }
+                />
+                <SmallSummaryCard
+                  label="DTE / Theta"
+                  value={
+                    latestDailySnapshot.nearest_dte === null
+                      ? "—"
+                      : `${latestDailySnapshot.nearest_dte} DTE`
+                  }
+                  subvalue={
+                    latestDailySnapshot.strategy_theta === null
+                      ? "Theta unavailable"
+                      : `${formatWholeCurrency(latestDailySnapshot.strategy_theta)} / day`
+                  }
+                />
+              </div>
+
+              <div className="mt-6 overflow-x-auto rounded border border-gray-200">
+                <table className="w-full min-w-[1050px] text-left text-sm">
+                  <thead className="bg-gray-50 text-xs uppercase tracking-wide text-gray-500">
+                    <tr>
+                      <th className="px-3 py-2">Date</th>
+                      <th className="px-3 py-2 text-right">Spot</th>
+                      <th className="px-3 py-2 text-right">MTM</th>
+                      <th className="px-3 py-2 text-right">Δ MTM</th>
+                      <th className="px-3 py-2 text-right">Realised</th>
+                      <th className="px-3 py-2 text-right">Total P&L</th>
+                      <th className="px-3 py-2 text-right">Capture</th>
+                      <th className="px-3 py-2 text-right">Delta lots</th>
+                      <th className="px-3 py-2 text-right">Theta/day</th>
+                      <th className="px-3 py-2 text-right">IV</th>
+                      <th className="px-3 py-2 text-right">DTE</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {dailySnapshots.slice(0, 30).map((snapshot, index) => {
+                      const older = dailySnapshots[index + 1];
+                      const mtmChange = older
+                        ? Number(snapshot.unrealised_mtm ?? 0) - Number(older.unrealised_mtm ?? 0)
+                        : null;
+
+                      return (
+                        <tr key={snapshot.id} className="border-t border-gray-200">
+                          <td className="px-3 py-3 font-semibold">{formatDate(snapshot.snapshot_date)}</td>
+                          <td className="px-3 py-3 text-right">
+                            {snapshot.current_spot_price === null ? "—" : `₹${formatNumber(snapshot.current_spot_price)}`}
+                          </td>
+                          <td className="px-3 py-3 text-right font-semibold">{formatCurrency(snapshot.unrealised_mtm)}</td>
+                          <td className={`px-3 py-3 text-right font-semibold ${
+                            mtmChange === null
+                              ? "text-gray-500"
+                              : mtmChange > 0
+                                ? "text-green-700"
+                                : mtmChange < 0
+                                  ? "text-red-700"
+                                  : "text-gray-700"
+                          }`}>
+                            {mtmChange === null ? "—" : formatCurrency(mtmChange)}
+                          </td>
+                          <td className="px-3 py-3 text-right">{formatCurrency(snapshot.realised_pnl)}</td>
+                          <td className="px-3 py-3 text-right font-semibold">{formatCurrency(snapshot.total_pnl)}</td>
+                          <td className="px-3 py-3 text-right">
+                            {snapshot.unrealised_capture_pct === null ? "—" : `${Number(snapshot.unrealised_capture_pct).toFixed(1)}%`}
+                          </td>
+                          <td className="px-3 py-3 text-right">{formatLots(snapshot.delta_lot_equivalent)}</td>
+                          <td className="px-3 py-3 text-right">
+                            {snapshot.strategy_theta === null ? "—" : formatWholeCurrency(snapshot.strategy_theta)}
+                          </td>
+                          <td className="px-3 py-3 text-right">
+                            {snapshot.weighted_iv === null ? "—" : `${Number(snapshot.weighted_iv).toFixed(2)}%`}
+                          </td>
+                          <td className="px-3 py-3 text-right">{snapshot.nearest_dte ?? "—"}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          ) : (
+            <p className="mt-5 rounded border border-dashed border-gray-300 bg-gray-50 p-4 text-sm text-gray-500">
+              No daily strategy snapshots are available yet. Use Refresh Market Data to save today&apos;s MTM and risk state.
+            </p>
+          )}
         </section>
 
         <section className="mt-6 rounded-lg border border-gray-300 bg-white p-6">
@@ -3283,6 +3502,26 @@ function GreekCard({ label, value, detail }: GreekCardProps) {
       <p className="text-xs font-semibold uppercase tracking-wide text-gray-500">{label}</p>
       <p className="mt-2 text-xl font-bold">{value}</p>
       <p className="mt-2 text-xs leading-5 text-gray-500">{detail}</p>
+    </div>
+  );
+}
+
+type SmallSummaryCardProps = {
+  label: string;
+  value: string;
+  subvalue: string;
+};
+
+function SmallSummaryCard({
+  label,
+  value,
+  subvalue,
+}: SmallSummaryCardProps) {
+  return (
+    <div className="rounded-lg border border-gray-200 bg-gray-50 p-4">
+      <p className="text-xs font-semibold uppercase tracking-wide text-gray-500">{label}</p>
+      <p className="mt-2 text-xl font-bold">{value}</p>
+      <p className="mt-1 text-xs text-gray-500">{subvalue}</p>
     </div>
   );
 }

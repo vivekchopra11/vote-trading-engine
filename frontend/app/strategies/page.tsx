@@ -8,6 +8,7 @@ const ZERODHA_LOGIN_URL =
   "https://vote-trading-engine-1.onrender.com/auth/zerodha/login";
 
 const CONCENTRATION_LIMIT_PCT = 30;
+const EXIT_DTE_POLICY = 6;
 
 type Strategy = {
   strategy_id: string;
@@ -26,6 +27,7 @@ type Strategy = {
   margin_status: string | null;
   margin_updated_at: string | null;
   market_data_updated_at: string | null;
+  current_spot_price: number | null;
   strategy_theta: number | null;
   delta_lot_equivalent: number | null;
 };
@@ -34,6 +36,7 @@ type DailySnapshot = {
   strategy_id: string;
   snapshot_date: string;
   captured_at: string;
+  current_spot_price: number | null;
   unrealised_mtm: number | null;
   realised_pnl: number | null;
   total_pnl: number | null;
@@ -186,6 +189,15 @@ function StrategyCard({
     : null;
   const mtmChange = previousMtm === null ? null : currentMtm - previousMtm;
 
+  const currentSpot = Number(strategy.current_spot_price ?? latestSnapshot?.current_spot_price ?? 0);
+  const previousSpot = previousSnapshot?.current_spot_price === null || previousSnapshot?.current_spot_price === undefined
+    ? null
+    : Number(previousSnapshot.current_spot_price);
+  const spotChangePct =
+    previousSpot !== null && previousSpot > 0 && currentSpot > 0
+      ? ((currentSpot - previousSpot) / previousSpot) * 100
+      : null;
+
   const capturePct = latestSnapshot?.unrealised_capture_pct ?? null;
   const dte = latestSnapshot?.nearest_dte ?? null;
   const deltaLots = strategy.delta_lot_equivalent;
@@ -193,9 +205,8 @@ function StrategyCard({
   const tone = concentrationTone(concentrationPct);
 
   return (
-    <Link
-      href={`/strategies/${encodeURIComponent(strategy.strategy_id)}`}
-      className={`group block rounded-2xl border ${tone.border} ${tone.background} p-5 shadow-sm transition hover:-translate-y-0.5 hover:shadow-md`}
+    <div
+      className={`group rounded-2xl border ${tone.border} ${tone.background} p-5 shadow-sm transition hover:shadow-md`}
     >
       <div className="flex items-start justify-between gap-4">
         <div className="min-w-0">
@@ -213,6 +224,16 @@ function StrategyCard({
           <p className="mt-1 text-xs text-gray-500">
             Expiry {formatExpiryMonth(strategy.expiry_month)}
           </p>
+          <div className="mt-2 flex flex-wrap items-baseline gap-2">
+            <p className="text-lg font-semibold text-gray-950">
+              {currentSpot > 0 ? `₹${currentSpot.toLocaleString("en-IN", { maximumFractionDigits: 2 })}` : "Spot —"}
+            </p>
+            {spotChangePct !== null && (
+              <p className={`text-xs font-semibold ${spotChangePct > 0 ? "text-emerald-700" : spotChangePct < 0 ? "text-red-700" : "text-gray-500"}`}>
+                {spotChangePct > 0 ? "+" : ""}{spotChangePct.toFixed(2)}% since prior snapshot
+              </p>
+            )}
+          </div>
         </div>
 
         <div className="shrink-0 text-right">
@@ -248,6 +269,13 @@ function StrategyCard({
           </div>
         </div>
       </div>
+
+      {dte !== null && dte <= EXIT_DTE_POLICY && (
+        <div className={`mt-4 rounded-lg border px-3 py-2 text-xs ${dte < EXIT_DTE_POLICY ? "border-red-300 bg-red-50 text-red-800" : "border-amber-300 bg-amber-50 text-amber-900"}`}>
+          <span className="font-bold">{dte < EXIT_DTE_POLICY ? "EXIT OVERDUE" : "EXIT WINDOW"}</span>
+          <span className="ml-2">Portfolio policy: close remaining positions by Expiry - {EXIT_DTE_POLICY}.</span>
+        </div>
+      )}
 
       <div className="mt-5 grid grid-cols-2 gap-x-5 gap-y-4">
         <div>
@@ -320,11 +348,16 @@ function StrategyCard({
               : "—"}
           </p>
         </div>
-        <span className="text-sm font-semibold text-gray-600 transition group-hover:text-gray-950">
-          Open strategy →
-        </span>
+        <div className="flex items-center gap-3">
+          <Link href={`/strategies/${encodeURIComponent(strategy.strategy_id)}/close`} className="text-xs font-semibold text-gray-500 hover:text-gray-950">
+            Close strategy
+          </Link>
+          <Link href={`/strategies/${encodeURIComponent(strategy.strategy_id)}`} className="text-sm font-semibold text-gray-600 transition hover:text-gray-950">
+            Open strategy →
+          </Link>
+        </div>
       </div>
-    </Link>
+    </div>
   );
 }
 
@@ -354,14 +387,14 @@ export default function StrategiesPage() {
         supabase
           .from("strategy_master")
           .select(
-            `strategy_id,strategy_name,symbol,strategy_type,direction,status,entry_date,expiry_month,closed_date,realised_pnl,unrealised_mtm,total_pnl,margin_used,margin_status,margin_updated_at,market_data_updated_at,strategy_theta,delta_lot_equivalent`,
+            `strategy_id,strategy_name,symbol,strategy_type,direction,status,entry_date,expiry_month,closed_date,realised_pnl,unrealised_mtm,total_pnl,margin_used,margin_status,margin_updated_at,market_data_updated_at,current_spot_price,strategy_theta,delta_lot_equivalent`,
           )
           .order("entry_date", { ascending: false }),
 
         supabase
           .from("strategy_daily_snapshots")
           .select(
-            "strategy_id,snapshot_date,captured_at,unrealised_mtm,realised_pnl,total_pnl,unrealised_capture_pct,nearest_dte",
+            "strategy_id,snapshot_date,captured_at,current_spot_price,unrealised_mtm,realised_pnl,total_pnl,unrealised_capture_pct,nearest_dte",
           )
           .order("snapshot_date", { ascending: false })
           .order("captured_at", { ascending: false })
