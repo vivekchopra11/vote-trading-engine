@@ -1350,7 +1350,7 @@ def refresh_strategy(request: RefreshStrategyRequest) -> dict[str, Any]:
             nearest_dte = None
             today_date = datetime.now(IST).date()
             dte_values: list[int] = []
-            for open_position in open_positions:
+            for open_position in positions:
                 expiry_value = open_position.get("expiry_date")
                 if not expiry_value:
                     continue
